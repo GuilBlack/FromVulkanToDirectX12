@@ -735,6 +735,7 @@ int main()
 
 		// Renderer
 		{
+		#pragma region Factory
 			// Factory /* 0001-I */
 			if (true)
 			{
@@ -796,8 +797,9 @@ int main()
 					SA_LOG(L"Create Factory success.", Info, DX12, factory.Get());
 				}
 			}
+		#pragma endregion // Factory
 
-
+		#pragma region Device /* 0002-I */
 			// Device /* 0002-I */
 			if (true)
 			{
@@ -912,8 +914,9 @@ int main()
 					}
 				}
 			}
+		#pragma endregion // Device /* 0002-I */
 
-
+		#pragma region Swapchain /* 0003-I */
 			// Swapchain /* 0003-I */
 			if (true)
 			{
@@ -994,8 +997,9 @@ int main()
 					}
 				}
 			}
+		#pragma endregion // Swapchain /* 0003-I */
 
-
+		#pragma region Commands /* 0004-I */
 			// Commands /* 0004-I */
 			if (true)
 			{
@@ -1039,8 +1043,9 @@ int main()
 				// Command list must be closed because we will start the frame by Reset()
 				cmdList->Close();
 			}
+		#pragma endregion // Commands /* 0004-I */
 
-
+		#pragma region Scene Textures /* 0005-I */
 			// Scene Textures /* 0005-I */
 			if (true)
 			{
@@ -1156,8 +1161,9 @@ int main()
 					device->CreateDepthStencilView(sceneDepthTexture.Get(), nullptr, sceneDepthRTViewHeap->GetCPUDescriptorHandleForHeapStart());
 				}
 			}
+		#pragma endregion // Scene Textures /* 0005-I */
 
-
+		#pragma region Pipeline /* 0008-I */
 			// Pipeline /* 0008-I */
 			if (true)
 			{
@@ -1551,14 +1557,16 @@ int main()
 					}
 				}
 			}
+		#pragma endregion // Pipeline /* 0008-I */
 
 
 			cmdList->Reset(cmdAllocs[0].Get(), nullptr);
 
-
+		#pragma region Scene Objects /* 0009-I */
 			// Scene Objects /* 0009-I */
 			if (true)
 			{
+			#pragma region PBR Sphere SRV View Heap
 				// PBR Sphere SRV View Heap
 				{
 					/**
@@ -1579,14 +1587,15 @@ int main()
 					}
 					else
 					{
-						const LPCWSTR name = L"PBR Sphere SRV ViewHeap";
-						pbrSphereSRVHeap->SetName(name);
+                        const LPCWSTR name = L"PBR Sphere SRV ViewHeap";
+                        pbrSphereSRVHeap->SetName(name);
 
-						SA_LOG(L"Create PBR Sphere SRV ViewHeap success.", Info, DX12, (L"\"%1\" [%2]", name, pbrSphereSRVHeap.Get()));
-					}
+                        SA_LOG(L"Create PBR Sphere SRV ViewHeap success.", Info, DX12, (L"\"%1\" [%2]", name, pbrSphereSRVHeap.Get()));
+                    }
 				}
+			#pragma endregion
 
-
+			#pragma region Camera Buffers
 				// Camera Buffers
 				{
 					const D3D12_HEAP_PROPERTIES heap{
@@ -1623,8 +1632,9 @@ int main()
 						}
 					}
 				}
+			#pragma endregion
 
-
+			#pragma region Sphere Object Buffer
 				// Sphere Object Buffer
 				{
 					const D3D12_HEAP_PROPERTIES heap{
@@ -1666,8 +1676,9 @@ int main()
 						return EXIT_FAILURE;
 					}
 				}
+			#pragma endregion
 
-
+			#pragma region PointLights Buffer
 				// PointLights Buffer
 				{
 					const D3D12_HEAP_PROPERTIES heap{
@@ -1739,9 +1750,11 @@ int main()
 						device->CreateShaderResourceView(pointLightBuffer.Get(), &viewDesc, cpuHandle);
 					}
 				}
+			#pragma endregion
 			}
+		#pragma endregion // Scene Objects /* 0009-I */
 
-
+		#pragma region Resources /* 0010-I */
 			// Resources /* 0010-I */
 			if (true)
 			{
@@ -2380,6 +2393,7 @@ int main()
 					}
 				}
 			}
+		#pragma endregion // Resources /* 0010-I */
 
 
 			cmdList->Close();
@@ -2660,10 +2674,10 @@ int main()
 	}
 
 
-
 	// Uninitialization
 	if(true)
 	{
+	#pragma region Uninitialization Renderer
 		// Renderer
 		{
 			WaitDeviceIdle();
@@ -2894,6 +2908,7 @@ int main()
 #endif
 			}
 		}
+	#pragma endregion // Uninitialization Renderer
 
 
 		// GLFW
