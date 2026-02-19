@@ -36,7 +36,7 @@ target_include_directories(FVTDX12_mainDX12 PRIVATE ${MY_AGILITY_SDK_INCLUDE_DIR
 target_compile_definitions(FVTDX12_mainDX12 PRIVATE FORCE_AGILITY_SDK_615=1)
 
 target_link_libraries(FVTDX12_mainDX12 PUBLIC d3d12.lib dxgi.lib dxguid.lib d3dcompiler.lib)
-target_link_libraries(FVTDX12_mainDX12 PUBLIC glfw assimp stb DirectXShaderCompiler SA_Logger SA_Maths)
+target_link_libraries(FVTDX12_mainDX12 PUBLIC glfw meshoptimizer assimp stb DirectXShaderCompiler SA_Logger SA_Maths)
 
 add_custom_command(
     TARGET FVTDX12_mainDX12
@@ -111,6 +111,7 @@ add_subdirectory(ThirdParty/stb)
 
 add_subdirectory(ThirdParty/DirectXShaderCompiler)
 
+add_subdirectory(ThirdParty/meshoptimizer)
 
 ## SA libraries
 add_subdirectory(ThirdParty/SA/Logger)
