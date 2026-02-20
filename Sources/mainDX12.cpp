@@ -414,8 +414,11 @@ struct ObjectUBO
 {
 	SA::Mat4f transform;
 };
-constexpr SA::Vec3f spherePosition(0.5f, 0.0f, 2.0f);
+constexpr SA::Vec3f spherePosition(-2.0f, 0.0f, 2.0f);
 MComPtr<ID3D12Resource> sphereObjectBuffer;
+MComPtr<ID3D12Resource> otherObjectBuffer;
+constexpr uint32_t objectCount = 11 * 11;
+constexpr uint32_t objectCountSqrt = 11;
 
 // = PointLights Buffer =
 struct PointLightUBO
@@ -706,29 +709,462 @@ void GenerateMipMapsCPU(SA::Vec2ui _extent, std::vector<char>& _data, uint32_t& 
 	}
 }
 
-// = Sphere =
-std::array<MComPtr<ID3D12Resource>, 4> sphereVertexBuffers; // VkBuffer -> ID3D12Resource
-MComPtr<ID3D12Resource> sphereMeshletBuffer;
-MComPtr<ID3D12Resource> sphereMeshletVertexIndexBuffer;
-MComPtr<ID3D12Resource> sphereMeshletTriangleIndexBuffer;
+uint32_t ImportMesh(
+	std::string_view							path,
+	const std::wstring&							meshName,
+	MComPtr<ID3D12Resource>&					meshletBuffer,
+	MComPtr<ID3D12Resource>&					meshletVertexIndexBuffer,
+	MComPtr<ID3D12Resource>&					meshletTriangleIndexBuffer,
+	std::array<MComPtr<ID3D12Resource>, 4>&		vertexBuffer,
+	std::array<D3D12_VERTEX_BUFFER_VIEW, 4>&	vertexBufferViews,
+	MComPtr<ID3D12Resource>&					indexBuffer,
+	D3D12_INDEX_BUFFER_VIEW&					indexBufferView,
+	uint32_t&									indexCount,
+	size_t&										numMeshlets
+)
+{
+	Assimp::Importer importer;
+	const aiScene* scene = importer.ReadFile(path.data(), aiProcess_CalcTangentSpace | aiProcess_ConvertToLeftHanded);
+	if (!scene)
+	{
+		SA_LOG(L"Assimp loading failed!", Error, Assimp, path);
+		return EXIT_FAILURE;
+	}
 
-/**
-* Vulkan binds the buffer directly
-* DirectX12 create 'views' (aka. how to read the memory) of buffers and use them for binding.
-*/
-std::array<D3D12_VERTEX_BUFFER_VIEW, 4> sphereVertexBufferViews;
-uint32_t sphereIndexCount = 0u;
-size_t numSphereMeshlets;
-MComPtr<ID3D12Resource> sphereIndexBuffer;
-D3D12_INDEX_BUFFER_VIEW sphereIndexBufferView;
+	const aiMesh* inMesh = scene->mMeshes[0];
+	std::wstring name = meshName + L"MeshletBuffer";
+
+#pragma region meshlet creation
+	// Create meshlet
+	{
+		constexpr size_t maxVertices = 64;
+		constexpr size_t maxTriangles = 126;
+		constexpr float coneWeight = 0.0f;
+
+		aiVector3D* pos = inMesh->mVertices;
+
+		// meshopt requires uint32_t and not uint16_t.
+		std::vector<uint32_t> indices;
+		indices.resize(inMesh->mNumFaces * 3);
+		indexCount = inMesh->mNumFaces * 3;
+		for (unsigned int i = 0; i < inMesh->mNumFaces; ++i)
+		{
+			indices[i * 3] = static_cast<uint32_t>(inMesh->mFaces[i].mIndices[0]);
+			indices[i * 3 + 1] = static_cast<uint32_t>(inMesh->mFaces[i].mIndices[1]);
+			indices[i * 3 + 2] = static_cast<uint32_t>(inMesh->mFaces[i].mIndices[2]);
+		}
+
+		uint32_t vertexCount = inMesh->mNumVertices;
+		size_t maxMeshlets = meshopt_buildMeshletsBound(indexCount, maxVertices, maxTriangles);
+
+		std::vector<meshopt_Meshlet>	meshlets(maxMeshlets);
+		std::vector<uint32_t>			meshletVertices(indexCount);
+		std::vector<uint8_t>			meshletTriangles(indexCount);
+		std::vector<MeshletData>		meshletData;
+
+		numMeshlets = meshopt_buildMeshlets(meshlets.data(), meshletVertices.data(), meshletTriangles.data(), indices.data(), indexCount, (float*)pos, vertexCount, sizeof(float) * 3, maxVertices, maxTriangles, coneWeight);
+		meshlets.resize(numMeshlets);
+		const meshopt_Meshlet& last = meshlets[numMeshlets - 1];
+		meshletVertices.resize(last.vertex_offset + last.vertex_count);
+		meshletTriangles.resize(last.triangle_offset + last.triangle_count * 3);
+
+		std::vector<uint32_t> meshletTriangles32(meshletTriangles.size());
+		for (uint32_t i = 0; i < meshletTriangles.size(); ++i)
+			meshletTriangles32[i] = (uint32_t)meshletTriangles[i];
+
+		meshletData.reserve(numMeshlets);
+		for (uint32_t i = 0; i < numMeshlets; ++i)
+		{
+			const meshopt_Meshlet& meshlet = meshlets[i];
+			meshopt_Bounds bounds = meshopt_computeMeshletBounds(meshletVertices.data(), meshletTriangles.data(),
+																 meshlet.triangle_count, (float*)pos, vertexCount, sizeof(float) * 3);
+
+			MeshletData data{
+				.VertexOffset = meshlet.vertex_offset,
+				.TriangleOffset = meshlet.triangle_offset,
+				.VertexCount = meshlet.vertex_count,
+				.TriangleCount = meshlet.triangle_count,
+
+				.BoundsCenter = SA::Vec3f(bounds.center[0], bounds.center[1], bounds.center[2]),
+				.BoundsRadius = bounds.radius,
+
+				//.ConeAxis = {bounds.cone_axis_s8[0], bounds.cone_axis_s8[1], bounds.cone_axis_s8[2]},
+				//.ConeCutoff = bounds.cone_cutoff_s8
+			};
+			meshletData.emplace_back(data);
+		}
+
+		const D3D12_HEAP_PROPERTIES heap{
+			.Type = D3D12_HEAP_TYPE_DEFAULT,
+		};
+		CD3DX12_RESOURCE_DESC desc = CD3DX12_RESOURCE_DESC::Buffer(meshletData.size() * sizeof(MeshletData));
+		HRESULT hr = device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&meshletBuffer));
+		if (FAILED(hr))
+		{
+			SA_LOG(L"Create Meshlet Buffer failed!", Error, DX12, (L"Error code: %1", hr));
+			return EXIT_FAILURE;
+		}
+		bool bSubmitSuccess = SubmitBufferToGPU(meshletBuffer, desc.Width, meshletData.data(), D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
+		if (!bSubmitSuccess)
+		{
+			SA_LOG(L"Meshlet Buffer submit failed!", Error, DX12);
+			return EXIT_FAILURE;
+		}
+		meshletBuffer->SetName(name.c_str());
+
+		desc = CD3DX12_RESOURCE_DESC::Buffer(meshletVertices.size() * sizeof(uint32_t));
+		hr = device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&meshletVertexIndexBuffer));
+		if (FAILED(hr))
+		{
+			SA_LOG(L"Create Meshlet Vertex Index Buffer failed!", Error, DX12, (L"Error code: %1", hr));
+			return EXIT_FAILURE;
+		}
+		bSubmitSuccess = SubmitBufferToGPU(meshletVertexIndexBuffer, desc.Width, meshletVertices.data(), D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
+		if (!bSubmitSuccess)
+		{
+			SA_LOG(L"Meshlet Vertex Index Buffer submit failed!", Error, DX12);
+			return EXIT_FAILURE;
+		}
+		name = meshName + L"MeshletVertexIndexBuffer";
+		meshletVertexIndexBuffer->SetName(name.c_str());
+
+		desc = CD3DX12_RESOURCE_DESC::Buffer(meshletTriangles32.size() * sizeof(uint32_t));
+		hr = device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&meshletTriangleIndexBuffer));
+		if (FAILED(hr))
+		{
+			SA_LOG(L"Create Meshlet Triangle Index Buffer failed!", Error, DX12, (L"Error code: %1", hr));
+			return EXIT_FAILURE;
+		}
+		bSubmitSuccess = SubmitBufferToGPU(meshletTriangleIndexBuffer, desc.Width, meshletTriangles32.data(), D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
+		if (!bSubmitSuccess)
+		{
+			SA_LOG(L"Meshlet Triangle Index Buffer submit failed!", Error, DX12);
+			return EXIT_FAILURE;
+		}
+		name = meshName + L"MeshletTriangleIndexBuffer";
+		meshletTriangleIndexBuffer->SetName(name.c_str());
+	}
+#pragma endregion
+
+#pragma region Position
+	// Position
+	{
+		/**
+		* VkMemoryPropertyFlagBits -> D3D12_HEAP_PROPERTIES.Type
+		* Defines if a buffer is GPU only, CPU-GPU, ...
+		* In Vulkan, a buffer can be GPU only or CPU-GPU for data transfer (read and write).
+		* In DirectX12, a buffer is either GPU only (default), 'Upload' for data transfer from CPU to GPU, or 'Readback' for data transfer from GPU to CPU.
+		* 'Upload' and 'Readback' at the same time is NOT possible.
+		*/
+		const D3D12_HEAP_PROPERTIES heap{
+			.Type = D3D12_HEAP_TYPE_DEFAULT, // Type Default is GPU only.
+		};
+
+		const D3D12_RESOURCE_DESC desc{
+			.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER,
+			.Alignment = 0,
+			.Width = sizeof(SA::Vec3f) * inMesh->mNumVertices,
+			.Height = 1,
+			.DepthOrArraySize = 1,
+			.MipLevels = 1,
+			.Format = DXGI_FORMAT_UNKNOWN,
+			.SampleDesc = {.Count = 1, .Quality = 0 },
+			.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+			.Flags = D3D12_RESOURCE_FLAG_NONE,
+		};
+
+		const HRESULT hrBufferCreated = device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&vertexBuffer[0]));
+		if (FAILED(hrBufferCreated))
+		{
+			SA_LOG(L"Create Vertex Position Buffer failed!", Error, DX12, (L"Error code: %1", hrBufferCreated));
+			return EXIT_FAILURE;
+		}
+		name = meshName + L"VertexPositionBuffer";
+		vertexBuffer[0]->SetName(name.c_str());
+
+		SA_LOG(L"Create Vertex Position Buffer success.", Info, DX12, (L"\"%1\" [%2]", name, vertexBuffer[0].Get()));
+
+		vertexBufferViews[0] = D3D12_VERTEX_BUFFER_VIEW{
+			.BufferLocation = vertexBuffer[0]->GetGPUVirtualAddress(),
+			.SizeInBytes = static_cast<UINT>(desc.Width),
+			.StrideInBytes = sizeof(SA::Vec3f),
+		};
+
+		const bool bSubmitSuccess = SubmitBufferToGPU(vertexBuffer[0], desc.Width, inMesh->mVertices, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
+		if (!bSubmitSuccess)
+		{
+			SA_LOG(L"Vertex Position Buffer submit failed!", Error, DX12);
+			return EXIT_FAILURE;
+		}
+	}
+#pragma endregion
+
+#pragma region Normal
+	// Normal
+	if (inMesh->HasNormals())
+	{
+		const D3D12_HEAP_PROPERTIES heap{
+			.Type = D3D12_HEAP_TYPE_DEFAULT,
+		};
+
+		const D3D12_RESOURCE_DESC desc{
+			.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER,
+			.Alignment = 0,
+			.Width = sizeof(SA::Vec3f) * inMesh->mNumVertices,
+			.Height = 1,
+			.DepthOrArraySize = 1,
+			.MipLevels = 1,
+			.Format = DXGI_FORMAT_UNKNOWN,
+			.SampleDesc = {.Count = 1, .Quality = 0 },
+			.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+			.Flags = D3D12_RESOURCE_FLAG_NONE,
+		};
+
+		const HRESULT hrBufferCreated = device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&vertexBuffer[1]));
+		if (FAILED(hrBufferCreated))
+		{
+			SA_LOG(L"Create Vertex Normal Buffer failed!", Error, DX12, (L"Error code: %1", hrBufferCreated));
+			return EXIT_FAILURE;
+		}
+		else
+		{
+			name = meshName + L"VertexNormalBuffer";
+			vertexBuffer[1]->SetName(name.c_str());
+
+			SA_LOG(L"Create Vertex Normal Buffer success.", Info, DX12, (L"\"%1\" [%2]", name, vertexBuffer[1].Get()));
+		}
+
+		vertexBufferViews[1] = D3D12_VERTEX_BUFFER_VIEW{
+			.BufferLocation = vertexBuffer[1]->GetGPUVirtualAddress(),
+			.SizeInBytes = static_cast<UINT>(desc.Width),
+			.StrideInBytes = sizeof(SA::Vec3f),
+		};
+
+		const bool bSubmitSuccess = SubmitBufferToGPU(vertexBuffer[1], desc.Width, inMesh->mNormals, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
+		if (!bSubmitSuccess)
+		{
+			SA_LOG(L"Vertex Normal Buffer submit failed!", Error, DX12);
+			return EXIT_FAILURE;
+		}
+	}
+#pragma endregion
+
+#pragma region Tangent
+	// Tangent
+	if (inMesh->HasTangentsAndBitangents())
+	{
+		const D3D12_HEAP_PROPERTIES heap{
+			.Type = D3D12_HEAP_TYPE_DEFAULT,
+		};
+
+		const D3D12_RESOURCE_DESC desc{
+			.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER,
+			.Alignment = 0,
+			.Width = sizeof(SA::Vec3f) * inMesh->mNumVertices,
+			.Height = 1,
+			.DepthOrArraySize = 1,
+			.MipLevels = 1,
+			.Format = DXGI_FORMAT_UNKNOWN,
+			.SampleDesc = {.Count = 1, .Quality = 0 },
+			.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+			.Flags = D3D12_RESOURCE_FLAG_NONE,
+		};
+
+		const HRESULT hrBufferCreated = device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&vertexBuffer[2]));
+		if (FAILED(hrBufferCreated))
+		{
+			SA_LOG(L"Create Vertex Tangent Buffer failed!", Error, DX12, (L"Error code: %1", hrBufferCreated));
+			return EXIT_FAILURE;
+		}
+		else
+		{
+			name = meshName + L"VertexTangentBuffer";
+			vertexBuffer[2]->SetName(name.c_str());
+
+			SA_LOG(L"Create Vertex Tangent Buffer success.", Info, DX12, (L"\"%1\" [%2]", name, vertexBuffer[2].Get()));
+		}
+
+		vertexBufferViews[2] = D3D12_VERTEX_BUFFER_VIEW{
+			.BufferLocation = vertexBuffer[2]->GetGPUVirtualAddress(),
+			.SizeInBytes = static_cast<UINT>(desc.Width),
+			.StrideInBytes = sizeof(SA::Vec3f),
+		};
+
+		const bool bSubmitSuccess = SubmitBufferToGPU(vertexBuffer[2], desc.Width, inMesh->mTangents, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
+		if (!bSubmitSuccess)
+		{
+			SA_LOG(L"Vertex Tangent Buffer submit failed!", Error, DX12);
+			return EXIT_FAILURE;
+		}
+	}
+#pragma endregion
+
+#pragma region UV
+	// UV
+	if (inMesh->HasTextureCoords(0))
+	{
+		const D3D12_HEAP_PROPERTIES heap{
+			.Type = D3D12_HEAP_TYPE_DEFAULT,
+		};
+
+		const D3D12_RESOURCE_DESC desc{
+			.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER,
+			.Alignment = 0,
+			.Width = sizeof(SA::Vec2f) * inMesh->mNumVertices,
+			.Height = 1,
+			.DepthOrArraySize = 1,
+			.MipLevels = 1,
+			.Format = DXGI_FORMAT_UNKNOWN,
+			.SampleDesc = {.Count = 1, .Quality = 0 },
+			.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+			.Flags = D3D12_RESOURCE_FLAG_NONE,
+		};
+
+		const HRESULT hrBufferCreated = device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&vertexBuffer[3]));
+		if (FAILED(hrBufferCreated))
+		{
+			SA_LOG(L"Create Vertex UV Buffer failed!", Error, DX12, (L"Error code: %1", hrBufferCreated));
+			return EXIT_FAILURE;
+		}
+		else
+		{
+			name = meshName + L"VertexUVBuffer";
+			vertexBuffer[3]->SetName(name.c_str());
+
+			SA_LOG(L"Create Vertex UV Buffer success.", Info, DX12, (L"\"%1\" [%2]", name, vertexBuffer[3].Get()));
+		}
+
+		vertexBufferViews[3] = D3D12_VERTEX_BUFFER_VIEW{
+			.BufferLocation = vertexBuffer[3]->GetGPUVirtualAddress(),
+			.SizeInBytes = static_cast<UINT>(desc.Width),
+			.StrideInBytes = sizeof(SA::Vec2f),
+		};
+
+		std::vector<SA::Vec2f> uvs;
+		uvs.reserve(inMesh->mNumVertices);
+
+		for (uint32_t i = 0; i < inMesh->mNumVertices; ++i)
+		{
+			uvs.push_back(SA::Vec2f{ inMesh->mTextureCoords[0][i].x, inMesh->mTextureCoords[0][i].y });
+		}
+
+		const bool bSubmitSuccess = SubmitBufferToGPU(vertexBuffer[3], desc.Width, uvs.data(), D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
+		if (!bSubmitSuccess)
+		{
+			SA_LOG(L"Vertex UV Buffer submit failed!", Error, DX12);
+			return EXIT_FAILURE;
+		}
+	}
+#pragma endregion
+
+#pragma region Index
+	// Index
+	{
+		const D3D12_HEAP_PROPERTIES heap{
+			.Type = D3D12_HEAP_TYPE_DEFAULT,
+		};
+
+		const D3D12_RESOURCE_DESC desc{
+			.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER,
+			.Alignment = 0,
+			.Width = sizeof(uint16_t) * inMesh->mNumFaces * 3,
+			.Height = 1,
+			.DepthOrArraySize = 1,
+			.MipLevels = 1,
+			.Format = DXGI_FORMAT_UNKNOWN,
+			.SampleDesc = {.Count = 1, .Quality = 0 },
+			.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+			.Flags = D3D12_RESOURCE_FLAG_NONE,
+		};
+
+		const HRESULT hrBufferCreated = device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&indexBuffer));
+		if (FAILED(hrBufferCreated))
+		{
+			SA_LOG(L"Create Index Buffer failed!", Error, DX12, (L"Error code: %1", hrBufferCreated));
+			return EXIT_FAILURE;
+		}
+		name = meshName + L"IndexBuffer";
+		indexBuffer->SetName(name.c_str());
+
+		SA_LOG(L"Create Index Buffer success.", Info, DX12, (L"\"%1\" [%2]", name, indexBuffer.Get()));
+
+		indexBufferView = D3D12_INDEX_BUFFER_VIEW{
+			.BufferLocation = indexBuffer->GetGPUVirtualAddress(),
+			.SizeInBytes = static_cast<UINT>(desc.Width),
+			.Format = DXGI_FORMAT_R16_UINT, // This model's indices are lower than 65535.
+		};
+
+		// Pack indices into uint16_t since max index < 65535.
+		std::vector<uint16_t> indices;
+		indices.resize(inMesh->mNumFaces * 3);
+		indexCount = inMesh->mNumFaces * 3;
+
+		for (unsigned int i = 0; i < inMesh->mNumFaces; ++i)
+		{
+			indices[i * 3] = static_cast<uint16_t>(inMesh->mFaces[i].mIndices[0]);
+			indices[i * 3 + 1] = static_cast<uint16_t>(inMesh->mFaces[i].mIndices[1]);
+			indices[i * 3 + 2] = static_cast<uint16_t>(inMesh->mFaces[i].mIndices[2]);
+		}
+
+		const bool bSubmitSuccess = SubmitBufferToGPU(indexBuffer, desc.Width, indices.data(), D3D12_RESOURCE_STATE_INDEX_BUFFER);
+		if (!bSubmitSuccess)
+		{
+			SA_LOG(L"Index Buffer submit failed!", Error, DX12);
+			return EXIT_FAILURE;
+		}
+	}
+	return 0;
+#pragma endregion
+}
+
+struct Mesh
+{
+	std::array<MComPtr<ID3D12Resource>, 4>	VertexBuffers{}; // VkBuffer -> ID3D12Resource
+	MComPtr<ID3D12Resource>					MeshletBuffer{};
+	MComPtr<ID3D12Resource>					MeshletVertexIndexBuffer{};
+	MComPtr<ID3D12Resource>					MeshletTriangleIndexBuffer{};
+
+	std::array<D3D12_VERTEX_BUFFER_VIEW, 4>	VertexBufferViews{};
+	uint32_t								IndexCount{};
+	size_t									NumMeshlets{};
+	MComPtr<ID3D12Resource>					IndexBuffer{};
+	D3D12_INDEX_BUFFER_VIEW					IndexBufferView{};
+};
+
+void DestroyMesh(Mesh& mesh)
+{
+	SA_LOG(L"Destroying Sphere Index Buffer...", Info, DX12, mesh.IndexBuffer.Get());
+	mesh.IndexBuffer = nullptr;
+	mesh.IndexBufferView = D3D12_INDEX_BUFFER_VIEW{};
+	SA_LOG(L"Destroying Sphere Vertex Position Buffer...", Info, DX12, mesh.VertexBuffers[0].Get());
+	mesh.VertexBuffers[0] = nullptr;
+	mesh.VertexBufferViews[0] = D3D12_VERTEX_BUFFER_VIEW{};
+	SA_LOG(L"Destroying Sphere Normal Position Buffer...", Info, DX12, mesh.VertexBuffers[1].Get());
+	mesh.VertexBuffers[1] = nullptr;
+	mesh.VertexBufferViews[1] = D3D12_VERTEX_BUFFER_VIEW{};
+
+	SA_LOG(L"Destroying Sphere Tangent Position Buffer...", Info, DX12, mesh.VertexBuffers[2].Get());
+	mesh.VertexBuffers[2] = nullptr;
+	mesh.VertexBufferViews[2] = D3D12_VERTEX_BUFFER_VIEW{};
+	SA_LOG(L"Destroying Sphere UV Position Buffer...", Info, DX12, mesh.VertexBuffers[3].Get());
+	mesh.VertexBuffers[3] = nullptr;
+	mesh.VertexBufferViews[3] = D3D12_VERTEX_BUFFER_VIEW{};
+
+	SA_LOG(L"Destroying Sphere Meshlet Buffers...", Info, DX12, mesh.MeshletBuffer.Get());
+	mesh.MeshletBuffer = nullptr;
+	mesh.MeshletVertexIndexBuffer = nullptr;
+	mesh.MeshletTriangleIndexBuffer = nullptr;
+}
+
+// = Sphere =
+Mesh sphereMesh{};
+Mesh bunnyMesh{};
 
 // = RustedIron2 PBR =
 MComPtr<ID3D12Resource> rustedIron2AlbedoTexture; // VkImage + VkDeviceMemory -> ID3D12Resource
 MComPtr<ID3D12Resource> rustedIron2NormalTexture;
 MComPtr<ID3D12Resource> rustedIron2MetallicTexture;
 MComPtr<ID3D12Resource> rustedIron2RoughnessTexture;
-
-
 
 int main()
 {
@@ -1619,7 +2055,7 @@ int main()
 					meshletPSODesc.NumRenderTargets = 1;
 					meshletPSODesc.DSVFormat = sceneDepthFormat;
 					meshletPSODesc.RasterizerState = CD3DX12_RASTERIZER_DESC(D3D12_DEFAULT);
-                    meshletPSODesc.RasterizerState.FrontCounterClockwise = FALSE;
+					meshletPSODesc.RasterizerState.FrontCounterClockwise = FALSE;
 					meshletPSODesc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
 					meshletPSODesc.BlendState = CD3DX12_BLEND_DESC(D3D12_DEFAULT);
 					meshletPSODesc.DepthStencilState = CD3DX12_DEPTH_STENCIL_DESC(D3D12_DEFAULT);
@@ -1726,18 +2162,7 @@ int main()
 						.Type = D3D12_HEAP_TYPE_DEFAULT,
 					};
 
-					const D3D12_RESOURCE_DESC desc{
-						.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER,
-						.Alignment = 0,
-						.Width = sizeof(ObjectUBO),
-						.Height = 1,
-						.DepthOrArraySize = 1,
-						.MipLevels = 1,
-						.Format = DXGI_FORMAT_UNKNOWN,
-						.SampleDesc = {.Count = 1, .Quality = 0 },
-						.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
-						.Flags = D3D12_RESOURCE_FLAG_NONE,
-					};
+					const D3D12_RESOURCE_DESC desc = CD3DX12_RESOURCE_DESC::Buffer(sizeof(ObjectUBO));
 
 					const HRESULT hrBufferCreated = device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&sphereObjectBuffer));
 					if (FAILED(hrBufferCreated))
@@ -1745,19 +2170,52 @@ int main()
 						SA_LOG(L"Create Sphere Object Buffer failed!", Error, DX12, (L"Error code: %1", hrBufferCreated));
 						return EXIT_FAILURE;
 					}
-					else
-					{
-						const LPCWSTR name = L"SphereObjectBuffer";
-						sphereObjectBuffer->SetName(name);
+					const LPCWSTR name = L"SphereObjectBuffer";
+					sphereObjectBuffer->SetName(name);
 
-						SA_LOG(L"Create Sphere Object Buffer failed!", Info, DX12, (L"\"%1\" [%2]", name, sphereObjectBuffer.Get()));
-					}
+					SA_LOG(L"Create Sphere Object Buffer success.", Info, DX12, (L"\"%1\" [%2]", name, sphereObjectBuffer.Get()));
 
 					const SA::Mat4f transform = SA::Mat4f::MakeTranslation(spherePosition);
 					const bool bSubmitSuccess = SubmitBufferToGPU(sphereObjectBuffer, desc.Width, &transform, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
 					if (!bSubmitSuccess)
 					{
 						SA_LOG(L"Sphere Object Buffer submit failed!", Error, DX12);
+						return EXIT_FAILURE;
+					}
+				}
+			#pragma endregion
+
+			#pragma region Other Object Buffer
+				{
+					const D3D12_HEAP_PROPERTIES heap{
+						.Type = D3D12_HEAP_TYPE_DEFAULT,
+					};
+
+					const D3D12_RESOURCE_DESC desc = CD3DX12_RESOURCE_DESC::Buffer(sizeof(ObjectUBO) * objectCount);
+
+					const HRESULT hrBufferCreated = device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&otherObjectBuffer));
+					if (FAILED(hrBufferCreated))
+					{
+						SA_LOG(L"Create Other Object Buffer failed!", Error, DX12, (L"Error code: %1", hrBufferCreated));
+						return EXIT_FAILURE;
+					}
+					const LPCWSTR name = L"OtherObjectBuffer";
+					otherObjectBuffer->SetName(name);
+
+					SA_LOG(L"Create Other Object Buffer success.", Info, DX12, (L"\"%1\" [%2]", name, otherObjectBuffer.Get()));
+					SA::Mat4f transforms[objectCount];
+					for (int x = 0; x < objectCountSqrt; ++x)
+					{
+						for (int z = 0; z < objectCountSqrt; ++z)
+						{
+							const SA::Vec3f pos = SA::Vec3f(-25.f + x * 5.0f, 0.0f, 10.f + z * 5.f);
+							transforms[x * objectCountSqrt + z] = SA::Mat4f::MakeTranslation(pos);
+						}
+					}
+					const bool bSubmitSuccess = SubmitBufferToGPU(otherObjectBuffer, desc.Width, &transforms, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
+					if (!bSubmitSuccess)
+					{
+						SA_LOG(L"Other Object Buffer submit failed!", Error, DX12);
 						return EXIT_FAILURE;
 					}
 				}
@@ -1843,402 +2301,39 @@ int main()
 			// Resources /* 0010-I */
 			if (true)
 			{
-				Assimp::Importer importer;
 
 				// Meshes
 				{
 					// Sphere
 					{
 						const char* path = "Resources/Models/Shapes/sphere.obj";
-						const aiScene* scene = importer.ReadFile(path, aiProcess_CalcTangentSpace | aiProcess_ConvertToLeftHanded);
-						if (!scene)
+						//uint32_t r = ImportMesh(
+						//	path, L"Sphere", 
+						//	sphereMesh.MeshletBuffer, sphereMesh.MeshletVertexIndexBuffer,
+						//	sphereMesh.MeshletTriangleIndexBuffer,
+						//	sphereMesh.VertexBuffers, sphereMesh.VertexBufferViews,
+						//	sphereMesh.IndexBuffer, sphereMesh.IndexBufferView,
+						//	sphereMesh.IndexCount, sphereMesh.NumMeshlets
+						//);
+// 						if (r == EXIT_FAILURE)
+// 						{
+// 							SA_LOG((L"Import Mesh {%1} failed!", path), Error, Assimp, (L"Error code: %1", r));
+// 							return EXIT_FAILURE;
+// 						}
+						path = "Resources/Models/Dragon.obj";
+						uint32_t r = ImportMesh(path, L"Bunny", 
+							bunnyMesh.MeshletBuffer, bunnyMesh.MeshletVertexIndexBuffer,
+							bunnyMesh.MeshletTriangleIndexBuffer,
+							bunnyMesh.VertexBuffers, bunnyMesh.VertexBufferViews,
+							bunnyMesh.IndexBuffer, bunnyMesh.IndexBufferView,
+							bunnyMesh.IndexCount, bunnyMesh.NumMeshlets
+						);
+
+						if (r == EXIT_FAILURE)
 						{
-							SA_LOG(L"Assimp loading failed!", Error, Assimp, path);
+							SA_LOG((L"Import Mesh {%1} failed!", path), Error, Assimp, (L"Error code: %1", r));
 							return EXIT_FAILURE;
 						}
-
-						const aiMesh* inMesh = scene->mMeshes[0];
-
-						// Create meshlet sphere
-						{
-							constexpr size_t maxVertices = 64;
-							constexpr size_t maxTriangles = 126;
-							constexpr float coneWeight = 0.2f;
-
-
-							aiVector3D* pos = inMesh->mVertices;
-
-							// meshopt requires uint32_t and not uint16_t.
-							std::vector<uint32_t> indices;
-							indices.resize(inMesh->mNumFaces * 3);
-							sphereIndexCount = inMesh->mNumFaces * 3;
-							for (unsigned int i = 0; i < inMesh->mNumFaces; ++i)
-							{
-								indices[i * 3] = static_cast<uint16_t>(inMesh->mFaces[i].mIndices[0]);
-								indices[i * 3 + 1] = static_cast<uint16_t>(inMesh->mFaces[i].mIndices[1]);
-								indices[i * 3 + 2] = static_cast<uint16_t>(inMesh->mFaces[i].mIndices[2]);
-							}
-
-							uint32_t vertexCount = inMesh->mNumVertices;
-							size_t maxMeshlets = meshopt_buildMeshletsBound(sphereIndexCount, maxVertices, maxTriangles);
-
-							std::vector<meshopt_Meshlet>	meshlets(maxMeshlets);
-							std::vector<uint32_t>			meshletVertices(sphereIndexCount);
-							std::vector<uint8_t>			meshletTriangles(sphereIndexCount);
-							std::vector<MeshletData>		meshletData;
-
-							numSphereMeshlets = meshopt_buildMeshlets(meshlets.data(), meshletVertices.data(), meshletTriangles.data(), indices.data(), sphereIndexCount, (float*)pos, vertexCount, sizeof(float) * 3, maxVertices, maxTriangles, coneWeight);
-							meshlets.resize(numSphereMeshlets);
-							const meshopt_Meshlet& last = meshlets[numSphereMeshlets - 1];
-							meshletVertices.resize(last.vertex_offset + last.vertex_count);
-							meshletTriangles.resize(last.triangle_offset + last.triangle_count * 3);
-
-							std::vector<uint32_t> meshletTriangles32(meshletTriangles.size());
-							for (uint32_t i = 0; i < meshletTriangles.size(); ++i)
-								meshletTriangles32[i] = (uint32_t)meshletTriangles[i];
-							
-							meshletData.reserve(numSphereMeshlets);
-							for (uint32_t i = 0; i < numSphereMeshlets; ++i)
-							{
-								const meshopt_Meshlet& meshlet = meshlets[i];
-								meshopt_Bounds bounds = meshopt_computeMeshletBounds(meshletVertices.data(), meshletTriangles.data(),
-																					 meshlet.triangle_count, (float*)pos, vertexCount, sizeof(float) * 3);
-								MeshletData data{
-									.VertexOffset = meshlet.vertex_offset,
-									.TriangleOffset = meshlet.triangle_offset,
-									.VertexCount = meshlet.vertex_count,
-									.TriangleCount = meshlet.triangle_count,
-
-									.BoundsCenter = SA::Vec3f(bounds.center[0], bounds.center[1], bounds.center[2]),
-									.BoundsRadius = bounds.radius,
-
-									//.ConeAxis = {bounds.cone_axis_s8[0], bounds.cone_axis_s8[1], bounds.cone_axis_s8[2]},
-									//.ConeCutoff = bounds.cone_cutoff_s8
-								};
-								meshletData.emplace_back(data);
-							}
-
-							const D3D12_HEAP_PROPERTIES heap{
-								.Type = D3D12_HEAP_TYPE_DEFAULT,
-							};
-							CD3DX12_RESOURCE_DESC desc = CD3DX12_RESOURCE_DESC::Buffer(meshletData.size() * sizeof(MeshletData));
-							HRESULT hr = device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&sphereMeshletBuffer));
-							if (FAILED(hr))
-							{
-								SA_LOG(L"Create Sphere Meshlet Buffer failed!", Error, DX12, (L"Error code: %1", hr));
-								return EXIT_FAILURE;
-							}
-							bool bSubmitSuccess = SubmitBufferToGPU(sphereMeshletBuffer, desc.Width, meshletData.data(), D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
-							if (!bSubmitSuccess)
-							{
-								SA_LOG(L"Sphere Meshlet Buffer submit failed!", Error, DX12);
-								return EXIT_FAILURE;
-							}
-							sphereMeshletBuffer->SetName(L"SphereMeshletBuffer");
-
-							desc = CD3DX12_RESOURCE_DESC::Buffer(meshletVertices.size() * sizeof(uint32_t));
-							hr = device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&sphereMeshletVertexIndexBuffer));
-							if (FAILED(hr))
-							{
-								SA_LOG(L"Create Sphere Vertex Position Buffer failed!", Error, DX12, (L"Error code: %1", hr));
-								return EXIT_FAILURE;
-							}
-							bSubmitSuccess = SubmitBufferToGPU(sphereMeshletVertexIndexBuffer, desc.Width, meshletVertices.data(), D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
-							if (!bSubmitSuccess)
-							{
-								SA_LOG(L"Sphere Meshlet Vertex Index Buffer submit failed!", Error, DX12);
-								return EXIT_FAILURE;
-							}
-							sphereMeshletVertexIndexBuffer->SetName(L"SphereMeshletVertexIndexBuffer");
-
-							desc = CD3DX12_RESOURCE_DESC::Buffer(meshletTriangles32.size() * sizeof(uint32_t));
-							hr = device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&sphereMeshletTriangleIndexBuffer));
-							if (FAILED(hr))
-							{
-								SA_LOG(L"Create Sphere Meshlet Triangle Index Buffer failed!", Error, DX12, (L"Error code: %1", hr));
-								return EXIT_FAILURE;
-							}
-							bSubmitSuccess = SubmitBufferToGPU(sphereMeshletTriangleIndexBuffer, desc.Width, meshletTriangles32.data(), D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
-							if (!bSubmitSuccess)
-							{
-								SA_LOG(L"Sphere Meshlet Triangle Index Buffer submit failed!", Error, DX12);
-								return EXIT_FAILURE;
-							}
-							sphereMeshletTriangleIndexBuffer->SetName(L"SphereMeshletTriangleIndexBuffer");
-						}
-
-					#pragma region Position
-						// Position
-						{
-							/**
-							* VkMemoryPropertyFlagBits -> D3D12_HEAP_PROPERTIES.Type
-							* Defines if a buffer is GPU only, CPU-GPU, ...
-							* In Vulkan, a buffer can be GPU only or CPU-GPU for data transfer (read and write).
-							* In DirectX12, a buffer is either GPU only (default), 'Upload' for data transfer from CPU to GPU, or 'Readback' for data transfer from GPU to CPU.
-							* 'Upload' and 'Readback' at the same time is NOT possible.
-							*/
-							const D3D12_HEAP_PROPERTIES heap{
-								.Type = D3D12_HEAP_TYPE_DEFAULT, // Type Default is GPU only.
-							};
-
-							const D3D12_RESOURCE_DESC desc{
-								.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER,
-								.Alignment = 0,
-								.Width = sizeof(SA::Vec3f) * inMesh->mNumVertices,
-								.Height = 1,
-								.DepthOrArraySize = 1,
-								.MipLevels = 1,
-								.Format = DXGI_FORMAT_UNKNOWN,
-								.SampleDesc = {.Count = 1, .Quality = 0 },
-								.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
-								.Flags = D3D12_RESOURCE_FLAG_NONE,
-							};
-
-							const HRESULT hrBufferCreated = device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&sphereVertexBuffers[0]));
-							if (FAILED(hrBufferCreated))
-							{
-								SA_LOG(L"Create Sphere Vertex Position Buffer failed!", Error, DX12, (L"Error code: %1", hrBufferCreated));
-								return EXIT_FAILURE;
-							}
-							else
-							{
-								const LPCWSTR name = L"SphereVertexPositionBuffer";
-								sphereVertexBuffers[0]->SetName(name);
-
-								SA_LOG(L"Create Sphere Vertex Position Buffer success.", Info, DX12, (L"\"%1\" [%2]", name, sphereVertexBuffers[0].Get()));
-							}
-
-							sphereVertexBufferViews[0] = D3D12_VERTEX_BUFFER_VIEW{
-								.BufferLocation = sphereVertexBuffers[0]->GetGPUVirtualAddress(),
-								.SizeInBytes = static_cast<UINT>(desc.Width),
-								.StrideInBytes = sizeof(SA::Vec3f),
-							};
-
-							const bool bSubmitSuccess = SubmitBufferToGPU(sphereVertexBuffers[0], desc.Width, inMesh->mVertices, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
-							if (!bSubmitSuccess)
-							{
-								SA_LOG(L"Sphere Vertex Position Buffer submit failed!", Error, DX12);
-								return EXIT_FAILURE;
-							}
-						}
-					#pragma endregion
-
-					#pragma region Normal
-						// Normal
-						{
-							const D3D12_HEAP_PROPERTIES heap{
-								.Type = D3D12_HEAP_TYPE_DEFAULT,
-							};
-
-							const D3D12_RESOURCE_DESC desc{
-								.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER,
-								.Alignment = 0,
-								.Width = sizeof(SA::Vec3f) * inMesh->mNumVertices,
-								.Height = 1,
-								.DepthOrArraySize = 1,
-								.MipLevels = 1,
-								.Format = DXGI_FORMAT_UNKNOWN,
-								.SampleDesc = {.Count = 1, .Quality = 0 },
-								.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
-								.Flags = D3D12_RESOURCE_FLAG_NONE,
-							};
-
-							const HRESULT hrBufferCreated = device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&sphereVertexBuffers[1]));
-							if (FAILED(hrBufferCreated))
-							{
-								SA_LOG(L"Create Sphere Vertex Normal Buffer failed!", Error, DX12, (L"Error code: %1", hrBufferCreated));
-								return EXIT_FAILURE;
-							}
-							else
-							{
-								const LPCWSTR name = L"SphereVertexNormalBuffer";
-								sphereVertexBuffers[1]->SetName(name);
-
-								SA_LOG(L"Create Sphere Vertex Normal Buffer success.", Info, DX12, (L"\"%1\" [%2]", name, sphereVertexBuffers[1].Get()));
-							}
-
-							sphereVertexBufferViews[1] = D3D12_VERTEX_BUFFER_VIEW{
-								.BufferLocation = sphereVertexBuffers[1]->GetGPUVirtualAddress(),
-								.SizeInBytes = static_cast<UINT>(desc.Width),
-								.StrideInBytes = sizeof(SA::Vec3f),
-							};
-
-							const bool bSubmitSuccess = SubmitBufferToGPU(sphereVertexBuffers[1], desc.Width, inMesh->mNormals, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
-							if (!bSubmitSuccess)
-							{
-								SA_LOG(L"Sphere Vertex Normal Buffer submit failed!", Error, DX12);
-								return EXIT_FAILURE;
-							}
-						}
-					#pragma endregion
-
-					#pragma region Tangent
-						// Tangent
-						{
-							const D3D12_HEAP_PROPERTIES heap{
-								.Type = D3D12_HEAP_TYPE_DEFAULT,
-							};
-
-							const D3D12_RESOURCE_DESC desc{
-								.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER,
-								.Alignment = 0,
-								.Width = sizeof(SA::Vec3f) * inMesh->mNumVertices,
-								.Height = 1,
-								.DepthOrArraySize = 1,
-								.MipLevels = 1,
-								.Format = DXGI_FORMAT_UNKNOWN,
-								.SampleDesc = {.Count = 1, .Quality = 0 },
-								.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
-								.Flags = D3D12_RESOURCE_FLAG_NONE,
-							};
-
-							const HRESULT hrBufferCreated = device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&sphereVertexBuffers[2]));
-							if (FAILED(hrBufferCreated))
-							{
-								SA_LOG(L"Create Sphere Vertex Tangent Buffer failed!", Error, DX12, (L"Error code: %1", hrBufferCreated));
-								return EXIT_FAILURE;
-							}
-							else
-							{
-								const LPCWSTR name = L"SphereVertexTangentBuffer";
-								sphereVertexBuffers[2]->SetName(name);
-
-								SA_LOG(L"Create Sphere Vertex Tangent Buffer success.", Info, DX12, (L"\"%1\" [%2]", name, sphereVertexBuffers[2].Get()));
-							}
-
-							sphereVertexBufferViews[2] = D3D12_VERTEX_BUFFER_VIEW{
-								.BufferLocation = sphereVertexBuffers[2]->GetGPUVirtualAddress(),
-								.SizeInBytes = static_cast<UINT>(desc.Width),
-								.StrideInBytes = sizeof(SA::Vec3f),
-							};
-
-							const bool bSubmitSuccess = SubmitBufferToGPU(sphereVertexBuffers[2], desc.Width, inMesh->mTangents, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
-							if (!bSubmitSuccess)
-							{
-								SA_LOG(L"Sphere Vertex Tangent Buffer submit failed!", Error, DX12);
-								return EXIT_FAILURE;
-							}
-						}
-					#pragma endregion
-
-					#pragma region UV
-						// UV
-						{
-							const D3D12_HEAP_PROPERTIES heap{
-								.Type = D3D12_HEAP_TYPE_DEFAULT,
-							};
-
-							const D3D12_RESOURCE_DESC desc{
-								.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER,
-								.Alignment = 0,
-								.Width = sizeof(SA::Vec2f) * inMesh->mNumVertices,
-								.Height = 1,
-								.DepthOrArraySize = 1,
-								.MipLevels = 1,
-								.Format = DXGI_FORMAT_UNKNOWN,
-								.SampleDesc = {.Count = 1, .Quality = 0 },
-								.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
-								.Flags = D3D12_RESOURCE_FLAG_NONE,
-							};
-
-							const HRESULT hrBufferCreated = device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&sphereVertexBuffers[3]));
-							if (FAILED(hrBufferCreated))
-							{
-								SA_LOG(L"Create Sphere Vertex UV Buffer failed!", Error, DX12, (L"Error code: %1", hrBufferCreated));
-								return EXIT_FAILURE;
-							}
-							else
-							{
-								const LPCWSTR name = L"SphereVertexUVBuffer";
-								sphereVertexBuffers[3]->SetName(name);
-
-								SA_LOG(L"Create Sphere Vertex UV Buffer success.", Info, DX12, (L"\"%1\" [%2]", name, sphereVertexBuffers[3].Get()));
-							}
-
-							sphereVertexBufferViews[3] = D3D12_VERTEX_BUFFER_VIEW{
-								.BufferLocation = sphereVertexBuffers[3]->GetGPUVirtualAddress(),
-								.SizeInBytes = static_cast<UINT>(desc.Width),
-								.StrideInBytes = sizeof(SA::Vec2f),
-							};
-
-							std::vector<SA::Vec2f> uvs;
-							uvs.reserve(inMesh->mNumVertices);
-
-							for (uint32_t i = 0; i < inMesh->mNumVertices; ++i)
-							{
-								uvs.push_back(SA::Vec2f{ inMesh->mTextureCoords[0][i].x, inMesh->mTextureCoords[0][i].y });
-							}
-
-							const bool bSubmitSuccess = SubmitBufferToGPU(sphereVertexBuffers[3], desc.Width, uvs.data(), D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
-							if (!bSubmitSuccess)
-							{
-								SA_LOG(L"Sphere Vertex UV Buffer submit failed!", Error, DX12);
-								return EXIT_FAILURE;
-							}
-						}
-					#pragma endregion
-
-					#pragma region Index
-						// Index
-						{
-							const D3D12_HEAP_PROPERTIES heap{
-								.Type = D3D12_HEAP_TYPE_DEFAULT,
-							};
-
-							const D3D12_RESOURCE_DESC desc{
-								.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER,
-								.Alignment = 0,
-								.Width = sizeof(uint16_t) * inMesh->mNumFaces * 3,
-								.Height = 1,
-								.DepthOrArraySize = 1,
-								.MipLevels = 1,
-								.Format = DXGI_FORMAT_UNKNOWN,
-								.SampleDesc = {.Count = 1, .Quality = 0 },
-								.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
-								.Flags = D3D12_RESOURCE_FLAG_NONE,
-							};
-
-							const HRESULT hrBufferCreated = device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&sphereIndexBuffer));
-							if (FAILED(hrBufferCreated))
-							{
-								SA_LOG(L"Create Sphere Index Buffer failed!", Error, DX12, (L"Error code: %1", hrBufferCreated));
-								return EXIT_FAILURE;
-							}
-							else
-							{
-								const LPCWSTR name = L"SphereIndexBuffer";
-								sphereIndexBuffer->SetName(name);
-
-								SA_LOG(L"Create Sphere Index Buffer success.", Info, DX12, (L"\"%1\" [%2]", name, sphereIndexBuffer.Get()));
-							}
-
-							sphereIndexBufferView = D3D12_INDEX_BUFFER_VIEW{
-								.BufferLocation = sphereIndexBuffer->GetGPUVirtualAddress(),
-								.SizeInBytes = static_cast<UINT>(desc.Width),
-								.Format = DXGI_FORMAT_R16_UINT, // This model's indices are lower than 65535.
-							};
-
-
-							// Pack indices into uint16_t since max index < 65535.
-							std::vector<uint16_t> indices;
-							indices.resize(inMesh->mNumFaces * 3);
-							sphereIndexCount = inMesh->mNumFaces * 3;
-
-							for (unsigned int i = 0; i < inMesh->mNumFaces; ++i)
-							{
-								indices[i * 3] = static_cast<uint16_t>(inMesh->mFaces[i].mIndices[0]);
-								indices[i * 3 + 1] = static_cast<uint16_t>(inMesh->mFaces[i].mIndices[1]);
-								indices[i * 3 + 2] = static_cast<uint16_t>(inMesh->mFaces[i].mIndices[2]);
-							}
-
-							const bool bSubmitSuccess = SubmitBufferToGPU(sphereIndexBuffer, desc.Width, indices.data(), D3D12_RESOURCE_STATE_INDEX_BUFFER);
-							if (!bSubmitSuccess)
-							{
-								SA_LOG(L"Sphere Index Buffer submit failed!", Error, DX12);
-								return EXIT_FAILURE;
-							}
-						}
-					#pragma endregion
 					}
 				}
 
@@ -2706,13 +2801,12 @@ int main()
 					// Set the fence value for the next frame.
 					swapchainFenceValues[swapchainFrameIndex] = prevFenceValue + 1;
 				}
-            #pragma endregion
+			#pragma endregion
 
-            #pragma region Update camera
+			#pragma region Update camera
 				// Update camera.
 				auto cameraBuffer = cameraBuffers[swapchainFrameIndex];
 				{
-
 					// Fill Data with updated values.
 					CameraUBO cameraUBO;
 					cameraUBO.view = cameraTr.Matrix();
@@ -2784,8 +2878,8 @@ int main()
 					cmd->RSSetViewports(1, &viewport);
 					cmd->RSSetScissorRects(1, &scissorRect);
 
-                    ID3D12DescriptorHeap* descriptorHeaps[] = { pbrSphereSRVHeap.Get() };
-                    cmd->SetDescriptorHeaps(_countof(descriptorHeaps), descriptorHeaps);
+					ID3D12DescriptorHeap* descriptorHeaps[] = { pbrSphereSRVHeap.Get() };
+					cmd->SetDescriptorHeaps(_countof(descriptorHeaps), descriptorHeaps);
 
 					// Lit Pipeline
 					{
@@ -2800,38 +2894,38 @@ int main()
 						* 0011-U-2
 						* DirectX12 doesn't have DescriptorSet: manually bind each entry of the RootSignature.
 						*/
-						cmd->SetGraphicsRootSignature(litRootSign.Get());
-						cmd->SetGraphicsRootConstantBufferView(0, cameraBuffer->GetGPUVirtualAddress()); // Camera UBO
-						cmd->SetGraphicsRootConstantBufferView(1, sphereObjectBuffer->GetGPUVirtualAddress()); // Object UBO
+						//cmd->SetGraphicsRootSignature(litRootSign.Get());
+						//cmd->SetGraphicsRootConstantBufferView(0, cameraBuffer->GetGPUVirtualAddress()); // Camera UBO
+						//cmd->SetGraphicsRootConstantBufferView(1, sphereObjectBuffer->GetGPUVirtualAddress()); // Object UBO
 
-						const UINT srvOffset = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-						D3D12_GPU_DESCRIPTOR_HANDLE gpuHandle = pbrSphereSRVHeap->GetGPUDescriptorHandleForHeapStart();
+						//const UINT srvOffset = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+						//D3D12_GPU_DESCRIPTOR_HANDLE gpuHandle = pbrSphereSRVHeap->GetGPUDescriptorHandleForHeapStart();
 
-						/**
-						* Use DescriptorTable with SRV type instead of direct SRV binding to create BufferView in SRV Heap.
-						* This allows use to correctly call pointLights.GetDimensions() in HLSL.
-						*/
-						//cmd->SetGraphicsRootShaderResourceView(2, pointLightBuffer->GetGPUVirtualAddress()); // PointLights
-						cmd->SetGraphicsRootDescriptorTable(2, gpuHandle); // PointLights
-						gpuHandle.ptr += srvOffset;
+						///**
+						//* Use DescriptorTable with SRV type instead of direct SRV binding to create BufferView in SRV Heap.
+						//* This allows use to correctly call pointLights.GetDimensions() in HLSL.
+						//*/
+						////cmd->SetGraphicsRootShaderResourceView(2, pointLightBuffer->GetGPUVirtualAddress()); // PointLights
+						//cmd->SetGraphicsRootDescriptorTable(2, gpuHandle); // PointLights
+						//gpuHandle.ptr += srvOffset;
 
-						cmd->SetGraphicsRootDescriptorTable(3, gpuHandle); // PBR textures
-						gpuHandle.ptr += srvOffset;
+						//cmd->SetGraphicsRootDescriptorTable(3, gpuHandle); // PBR textures
+						//gpuHandle.ptr += srvOffset;
 
 
-						/* 0008-U */
+						///* 0008-U */
 						//cmd->SetPipelineState(litPipelineState.Get());
 
 						//// Draw Sphere
 						//cmd->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-						//cmd->IASetVertexBuffers(0, static_cast<UINT>(sphereVertexBufferViews.size()), sphereVertexBufferViews.data());
-						//cmd->IASetIndexBuffer(&sphereIndexBufferView);
-						//cmd->DrawIndexedInstanced(sphereIndexCount, 1, 0, 0, 0);
+						//cmd->IASetVertexBuffers(0, static_cast<UINT>(sphereMesh.VertexBufferViews.size()), sphereMesh.VertexBufferViews.data());
+						//cmd->IASetIndexBuffer(&sphereMesh.IndexBufferView);
+						//cmd->DrawIndexedInstanced(sphereMesh.IndexCount, 1, 0, 0, 0);
 					}
 
-                    // Meshlet Pipeline
+					// Meshlet Pipeline
 					{
-                    //#define ROOT_SIG "CBV(b0), \
+					//#define ROOT_SIG "CBV(b0), \
 									  //CBV(b1), \
 									  //SRV(t0), \
 									  //SRV(t1), \
@@ -2840,36 +2934,39 @@ int main()
 									  //SRV(t4), \
 									  //SRV(t5), \
 									  //SRV(t6)"
-                        //ConstantBuffer<Camera>          cameraBuffer : register(b0);
-                        //ConstantBuffer<Object>          objectBuffer : register(b1);
+						//ConstantBuffer<Camera>          cameraBuffer : register(b0);
+						//ConstantBuffer<Object>          objectBuffer : register(b1);
 
-                        //StructuredBuffer<float3>        vertices : register(t0);
-                        //StructuredBuffer<float3>        normals : register(t1);
-                        //StructuredBuffer<float3>        tangents : register(t2);
-                        //StructuredBuffer<float2>        uvs : register(t3);
+						//StructuredBuffer<float3>        vertices : register(t0);
+						//StructuredBuffer<float3>        normals : register(t1);
+						//StructuredBuffer<float3>        tangents : register(t2);
+						//StructuredBuffer<float2>        uvs : register(t3);
 
-                        //StructuredBuffer<MeshletData>   meshlets : register(t4);
-                        //StructuredBuffer<uint>          meshletVertexIndices : register(t5);
-                        //StructuredBuffer<uint>          meshletTriangleIndices : register(t6);
+						//StructuredBuffer<MeshletData>   meshlets : register(t4);
+						//StructuredBuffer<uint>          meshletVertexIndices : register(t5);
+						//StructuredBuffer<uint>          meshletTriangleIndices : register(t6);
 
 						cmd->SetGraphicsRootSignature(meshletRootSig.Get());
 						cmd->SetGraphicsRootConstantBufferView(0, cameraBuffer->GetGPUVirtualAddress());
-						cmd->SetGraphicsRootConstantBufferView(1, sphereObjectBuffer->GetGPUVirtualAddress());
+						cmd->SetGraphicsRootShaderResourceView(1, otherObjectBuffer->GetGPUVirtualAddress());
 
-						cmd->SetGraphicsRootShaderResourceView(2, sphereVertexBuffers[0]->GetGPUVirtualAddress());
-						cmd->SetGraphicsRootShaderResourceView(3, sphereVertexBuffers[1]->GetGPUVirtualAddress());
-						cmd->SetGraphicsRootShaderResourceView(4, sphereVertexBuffers[2]->GetGPUVirtualAddress());
-						cmd->SetGraphicsRootShaderResourceView(5, sphereVertexBuffers[3]->GetGPUVirtualAddress());
+						cmd->SetGraphicsRootShaderResourceView(2, bunnyMesh.VertexBuffers[0]->GetGPUVirtualAddress());
 
-						cmd->SetGraphicsRootShaderResourceView(6, sphereMeshletBuffer->GetGPUVirtualAddress());
-						cmd->SetGraphicsRootShaderResourceView(7, sphereMeshletVertexIndexBuffer->GetGPUVirtualAddress());
-						cmd->SetGraphicsRootShaderResourceView(8, sphereMeshletTriangleIndexBuffer->GetGPUVirtualAddress());
+						if (bunnyMesh.VertexBuffers[1] != nullptr)
+							cmd->SetGraphicsRootShaderResourceView(3, bunnyMesh.VertexBuffers[1]->GetGPUVirtualAddress());
 
+						if (bunnyMesh.VertexBuffers[2] != nullptr)
+							cmd->SetGraphicsRootShaderResourceView(4, bunnyMesh.VertexBuffers[2]->GetGPUVirtualAddress());
+
+						if (bunnyMesh.VertexBuffers[3] != nullptr)
+							cmd->SetGraphicsRootShaderResourceView(5, bunnyMesh.VertexBuffers[3]->GetGPUVirtualAddress());
+
+						cmd->SetGraphicsRootShaderResourceView(6, bunnyMesh.MeshletBuffer->GetGPUVirtualAddress());
+						cmd->SetGraphicsRootShaderResourceView(7, bunnyMesh.MeshletVertexIndexBuffer->GetGPUVirtualAddress());
+						cmd->SetGraphicsRootShaderResourceView(8, bunnyMesh.MeshletTriangleIndexBuffer->GetGPUVirtualAddress());
 						cmd->SetPipelineState(meshletPipelineState.Get());
-						cmd->DispatchMesh((uint32_t)numSphereMeshlets, 1, 1);
+						cmd->DispatchMesh((uint32_t)bunnyMesh.NumMeshlets, objectCount, 1);
 					}
-
-
 
 					// Manage RenderTargets for present. 0006-U2
 					{
@@ -2887,7 +2984,6 @@ int main()
 
 						cmd->ResourceBarrier(1, &barrier);
 					}
-
 
 					cmd->Close();
 
@@ -2958,30 +3054,8 @@ int main()
 				{
 					// Sphere
 					{
-						SA_LOG(L"Destroying Sphere Index Buffer...", Info, DX12, sphereIndexBuffer.Get());
-						sphereIndexBuffer = nullptr;
-						sphereIndexBufferView = D3D12_INDEX_BUFFER_VIEW{};
-
-						SA_LOG(L"Destroying Sphere Vertex Position Buffer...", Info, DX12, sphereVertexBuffers[0].Get());
-						sphereVertexBuffers[0] = nullptr;
-						sphereVertexBufferViews[0] = D3D12_VERTEX_BUFFER_VIEW{};
-
-						SA_LOG(L"Destroying Sphere Normal Position Buffer...", Info, DX12, sphereVertexBuffers[1].Get());
-						sphereVertexBuffers[1] = nullptr;
-						sphereVertexBufferViews[1] = D3D12_VERTEX_BUFFER_VIEW{};
-
-						SA_LOG(L"Destroying Sphere Tangent Position Buffer...", Info, DX12, sphereVertexBuffers[2].Get());
-						sphereVertexBuffers[2] = nullptr;
-						sphereVertexBufferViews[2] = D3D12_VERTEX_BUFFER_VIEW{};
-
-						SA_LOG(L"Destroying Sphere UV Position Buffer...", Info, DX12, sphereVertexBuffers[3].Get());
-						sphereVertexBuffers[3] = nullptr;
-						sphereVertexBufferViews[3] = D3D12_VERTEX_BUFFER_VIEW{};
-
-						SA_LOG(L"Destroying Sphere Meshlet Buffers...", Info, DX12, sphereMeshletBuffer.Get());
-						sphereMeshletBuffer = nullptr;
-						sphereMeshletVertexIndexBuffer = nullptr;
-						sphereMeshletTriangleIndexBuffer = nullptr;
+						DestroyMesh(sphereMesh);
+						DestroyMesh(bunnyMesh);
 					}
 				}
 			}
@@ -3002,6 +3076,11 @@ int main()
 				{
 					SA_LOG(L"Destroying Sphere Object Buffer...", Info, DX12, sphereObjectBuffer.Get());
 					sphereObjectBuffer = nullptr;
+				}
+
+				{
+					SA_LOG(L"Destroying Sphere Object Buffer for Meshlet Pipeline...", Info, DX12, otherObjectBuffer.Get());
+					otherObjectBuffer = nullptr;
 				}
 
 				// PointLights Buffer

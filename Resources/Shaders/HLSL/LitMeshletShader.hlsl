@@ -1,5 +1,5 @@
 #define ROOT_SIG "CBV(b0), \
-                  CBV(b1), \
+                  SRV(t7), \
                   SRV(t0), \
                   SRV(t1), \
                   SRV(t2), \
@@ -12,7 +12,8 @@ struct VertexOutput
 {
     /// Shader view position
     float4 svPosition : SV_POSITION;
-
+    float3 worldPosition : POSITION0;
+    float3 color : COLOR0;
     /// Vertex UV
     float2 uv : TEXCOORD0;
 };
@@ -47,7 +48,7 @@ struct MeshletData
 };
 
 ConstantBuffer<Camera>          cameraBuffer : register(b0);
-ConstantBuffer<Object>          objectBuffer : register(b1);
+StructuredBuffer<Object>        objectBuffer : register(t7);
 
 StructuredBuffer<float3>        vertices : register(t0);
 StructuredBuffer<float3>        normals : register(t1);
@@ -84,11 +85,11 @@ void mainMS(
     {
         uint vertexIndex = meshletVertexIndices[m.VertexOffset + gtid.x];
         // verts[gtid.x].worldPosition = mul(world, float4(vertices[vertexIndex], 1.0));
-        float4 worldPosition = mul(objectBuffer.transform, float4(vertices[vertexIndex], 1.0));
+        float4 worldPosition = mul(objectBuffer[gid.y].transform, float4(vertices[vertexIndex], 1.0));
         //verts[gtid.x].viewPosition = float3(cameraBuffer.view._14, cameraBuffer.view._24, cameraBuffer.view._34);
         verts[gtid.x].svPosition = mul(cameraBuffer.invViewProj, float4(/*verts[gtid.x].*/worldPosition));
-        verts[gtid.x].uv = uvs[vertexIndex];
-        //verts[gtid.x].color = float4(float(gid.x & 1), float(gid.x & 3) / 4.0, float(gid.x & 7) / 8.0, 1.0);
+        //verts[gtid.x].uv = uvs[vertexIndex];
+        verts[gtid.x].color = float3(float(gid.x & 1), float(gid.x & 3) / 4.0, float(gid.x & 7) / 8.0);
     }
 }
 
@@ -102,6 +103,6 @@ struct PixelOutput
 PixelOutput mainPS(VertexInput input)
 {
     PixelOutput output;
-    output.color = float4(1.0, 1.0, 1.0, 1.0);
+    output.color = float4(input.color, 1.0);
     return output;
 }
