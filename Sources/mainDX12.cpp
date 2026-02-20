@@ -452,8 +452,8 @@ struct MeshletData
 	SA::Vec3f       BoundsCenter;
 	float           BoundsRadius;
 
-	//int8_t          ConeAxis[3];
-	//int8_t          ConeCutoff;
+	int8_t          ConeAxis[3];
+	int8_t          ConeCutoff;
 };
 
 #define STB_IMAGE_IMPLEMENTATION
@@ -768,9 +768,14 @@ uint32_t ImportMesh(
 		meshletVertices.resize(last.vertex_offset + last.vertex_count);
 		meshletTriangles.resize(last.triangle_offset + last.triangle_count * 3);
 
-		std::vector<uint32_t> meshletTriangles32(meshletTriangles.size());
-		for (uint32_t i = 0; i < meshletTriangles.size(); ++i)
-			meshletTriangles32[i] = (uint32_t)meshletTriangles[i];
+		size_t meshletTrianglesCount = meshletTriangles.size() / 3; // from triangle count to index count
+		std::vector<uint8_t> meshletTriangles32(meshletTriangles.size() + meshletTrianglesCount);
+		size_t trueTriIndex = 0;
+		for (size_t i = 0; i < meshletTrianglesCount * 4; ++i)
+		{
+			if (i % 4 != 3)
+				meshletTriangles32[i] = meshletTriangles[trueTriIndex++];
+		}
 
 		meshletData.reserve(numMeshlets);
 		for (uint32_t i = 0; i < numMeshlets; ++i)
@@ -781,15 +786,15 @@ uint32_t ImportMesh(
 
 			MeshletData data{
 				.VertexOffset = meshlet.vertex_offset,
-				.TriangleOffset = meshlet.triangle_offset,
+				.TriangleOffset = meshlet.triangle_offset / 3,
 				.VertexCount = meshlet.vertex_count,
 				.TriangleCount = meshlet.triangle_count,
 
 				.BoundsCenter = SA::Vec3f(bounds.center[0], bounds.center[1], bounds.center[2]),
 				.BoundsRadius = bounds.radius,
 
-				//.ConeAxis = {bounds.cone_axis_s8[0], bounds.cone_axis_s8[1], bounds.cone_axis_s8[2]},
-				//.ConeCutoff = bounds.cone_cutoff_s8
+				.ConeAxis = {bounds.cone_axis_s8[0], bounds.cone_axis_s8[1], bounds.cone_axis_s8[2]},
+				.ConeCutoff = bounds.cone_cutoff_s8
 			};
 			meshletData.emplace_back(data);
 		}
@@ -828,7 +833,7 @@ uint32_t ImportMesh(
 		name = meshName + L"MeshletVertexIndexBuffer";
 		meshletVertexIndexBuffer->SetName(name.c_str());
 
-		desc = CD3DX12_RESOURCE_DESC::Buffer(meshletTriangles32.size() * sizeof(uint32_t));
+		desc = CD3DX12_RESOURCE_DESC::Buffer(meshletTrianglesCount * sizeof(uint32_t)); // packed in 32-bit
 		hr = device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&meshletTriangleIndexBuffer));
 		if (FAILED(hr))
 		{

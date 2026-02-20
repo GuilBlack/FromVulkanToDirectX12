@@ -38,13 +38,15 @@ struct Object
 
 struct MeshletData
 {
-    uint32_t        VertexOffset;
-    uint32_t        TriangleOffset;
-    uint32_t        VertexCount;
-    uint32_t        TriangleCount;
+    uint            VertexOffset;
+    uint            TriangleOffset;
+    uint            VertexCount;
+    uint            TriangleCount;
 
     float3          BoundsCenter;
     float           BoundsRadius;
+
+    uint            ConeInfo; // ConeAxis[3], ConeCutoff in int8_t
 };
 
 ConstantBuffer<Camera>          cameraBuffer : register(b0);
@@ -58,6 +60,15 @@ StructuredBuffer<float2>        uvs : register(t3);
 StructuredBuffer<MeshletData>   meshlets : register(t4);
 StructuredBuffer<uint>          meshletVertexIndices : register(t5);
 StructuredBuffer<uint>          meshletTriangleIndices : register(t6);
+
+uint3 GetIndices(uint triangleInd)
+{
+    uint3 tri;
+    tri.x = meshletTriangleIndices[triangleInd] & 0xFF;
+    tri.y = (meshletTriangleIndices[triangleInd] >> 8) & 0xFF;
+    tri.z = (meshletTriangleIndices[triangleInd] >> 16) & 0xFF;
+    return tri;
+}
 
 [RootSignature(ROOT_SIG)]
 [NumThreads(128, 1, 1)]
@@ -74,11 +85,7 @@ void mainMS(
 
     if (gtid.x < m.TriangleCount)
     {
-        uint3 tri;
-        tri.x = meshletTriangleIndices[m.TriangleOffset + gtid.x * 3 + 0];
-        tri.y = meshletTriangleIndices[m.TriangleOffset + gtid.x * 3 + 1];
-        tri.z = meshletTriangleIndices[m.TriangleOffset + gtid.x * 3 + 2];
-        tris[gtid.x] = tri;
+        tris[gtid.x] = GetIndices(m.TriangleOffset + gtid.x);
     }
 
     if (gtid.x < m.VertexCount)
