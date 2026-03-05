@@ -381,6 +381,7 @@ MComPtr<ID3DBlob> CompileShader(std::wstring _path, std::wstring _entry, std::ws
 MComPtr<ID3DBlob> litVertexShader; // VkShaderModule -> ID3DBlob
 MComPtr<ID3DBlob> litPixelShader;
 
+MComPtr<ID3DBlob> litAmplShaderMeshlet;
 MComPtr<ID3DBlob> litMeshShaderMeshlet;
 MComPtr<ID3DBlob> litPixelShaderMeshlet;
 
@@ -400,9 +401,11 @@ struct CameraUBO
 {
 	SA::Mat4f view;
 	SA::Mat4f invViewProj;
+	SA::Vec3f position;
 };
 SA::TransformPRf cameraTr;
-constexpr float cameraMoveSpeed = 4.0f;
+constexpr float cameraMoveSpeed = 10.0f;
+constexpr float cameraMoveSpeedFast = 20.0f;
 constexpr float cameraRotSpeed = 16.0f;
 constexpr float cameraNear = 0.1f;
 constexpr float cameraFar = 1000.0f;
@@ -417,8 +420,8 @@ struct ObjectUBO
 constexpr SA::Vec3f spherePosition(-2.0f, 0.0f, 2.0f);
 MComPtr<ID3D12Resource> sphereObjectBuffer;
 MComPtr<ID3D12Resource> otherObjectBuffer;
-constexpr uint32_t objectCount = 11 * 11;
-constexpr uint32_t objectCountSqrt = 11;
+constexpr uint32_t objectCount = 5 * 5;
+constexpr uint32_t objectCountSqrt = 5;
 
 // = PointLights Buffer =
 struct PointLightUBO
@@ -452,8 +455,10 @@ struct MeshletData
 	SA::Vec3f       BoundsCenter;
 	float           BoundsRadius;
 
-	int8_t          ConeAxis[3];
-	int8_t          ConeCutoff;
+//     int8_t         ConeAxis[3];
+//     int8_t         ConeCutoff;
+    SA::Vec3f       ConeAxis;
+    float           ConeCutoff;
 };
 
 #define STB_IMAGE_IMPLEMENTATION
@@ -781,8 +786,10 @@ uint32_t ImportMesh(
 		for (uint32_t i = 0; i < numMeshlets; ++i)
 		{
 			const meshopt_Meshlet& meshlet = meshlets[i];
-			meshopt_Bounds bounds = meshopt_computeMeshletBounds(meshletVertices.data(), meshletTriangles.data(),
-																 meshlet.triangle_count, (float*)pos, vertexCount, sizeof(float) * 3);
+			meshopt_Bounds bounds = meshopt_computeMeshletBounds(
+				meshletVertices.data() + meshlet.vertex_offset,
+				meshletTriangles.data() + meshlet.triangle_offset,
+				meshlet.triangle_count, (float*)pos, vertexCount, sizeof(float) * 3);
 
 			MeshletData data{
 				.VertexOffset = meshlet.vertex_offset,
@@ -793,8 +800,10 @@ uint32_t ImportMesh(
 				.BoundsCenter = SA::Vec3f(bounds.center[0], bounds.center[1], bounds.center[2]),
 				.BoundsRadius = bounds.radius,
 
-				.ConeAxis = {bounds.cone_axis_s8[0], bounds.cone_axis_s8[1], bounds.cone_axis_s8[2]},
-				.ConeCutoff = bounds.cone_cutoff_s8
+				//.ConeAxis = {bounds.cone_axis_s8[0], bounds.cone_axis_s8[1], bounds.cone_axis_s8[2]},
+				//.ConeCutoff = bounds.cone_cutoff_s8
+				.ConeAxis = {bounds.cone_axis[0], bounds.cone_axis[1], bounds.cone_axis[2]},
+				.ConeCutoff = bounds.cone_cutoff
 			};
 			meshletData.emplace_back(data);
 		}
@@ -1163,7 +1172,7 @@ void DestroyMesh(Mesh& mesh)
 
 // = Sphere =
 Mesh sphereMesh{};
-Mesh bunnyMesh{};
+Mesh dragonMesh{};
 
 // = RustedIron2 PBR =
 MComPtr<ID3D12Resource> rustedIron2AlbedoTexture; // VkImage + VkDeviceMemory -> ID3D12Resource
@@ -2030,6 +2039,9 @@ int main()
 
 			#pragma region Meshlet
 				{
+					litAmplShaderMeshlet = CompileShader(L"Resources/Shaders/HLSL/LitMeshletShader.hlsl", L"mainAS", L"as_6_5");
+					if (!litAmplShaderMeshlet)
+						return EXIT_FAILURE;
 					litMeshShaderMeshlet = CompileShader(L"Resources/Shaders/HLSL/LitMeshletShader.hlsl", L"mainMS", L"ms_6_5");
 					if (!litMeshShaderMeshlet)
 						return EXIT_FAILURE;
@@ -2037,7 +2049,7 @@ int main()
 					if (!litPixelShaderMeshlet)
 						return EXIT_FAILURE;
 
-					HRESULT hres = device->CreateRootSignature(0, litMeshShaderMeshlet->GetBufferPointer(), litMeshShaderMeshlet->GetBufferSize(), IID_PPV_ARGS(&meshletRootSig));
+					HRESULT hres = device->CreateRootSignature(0, litAmplShaderMeshlet->GetBufferPointer(), litAmplShaderMeshlet->GetBufferSize(), IID_PPV_ARGS(&meshletRootSig));
 					if (FAILED(hres))
 					{
 						SA_LOG(L"Create Meshlet Root Signature failed!", Error, DX12, (L"Error Code: %1", hres));
@@ -2048,6 +2060,10 @@ int main()
 
 					D3DX12_MESH_SHADER_PIPELINE_STATE_DESC meshletPSODesc = {};
 					meshletPSODesc.pRootSignature = meshletRootSig.Get();
+					meshletPSODesc.AS = {
+						.pShaderBytecode = litAmplShaderMeshlet->GetBufferPointer(),
+						.BytecodeLength = litAmplShaderMeshlet->GetBufferSize()
+					};
 					meshletPSODesc.MS = {
 						.pShaderBytecode = litMeshShaderMeshlet->GetBufferPointer(),
 						.BytecodeLength = litMeshShaderMeshlet->GetBufferSize()
@@ -2209,6 +2225,9 @@ int main()
 
 					SA_LOG(L"Create Other Object Buffer success.", Info, DX12, (L"\"%1\" [%2]", name, otherObjectBuffer.Get()));
 					SA::Mat4f transforms[objectCount];
+
+					SA::Quatf rot = SA::Quatf::FromEuler(SA::Vec3f(90.0f, 0.0f, 0.0f));
+					auto matRot = SA::Mat4f::MakeRotation(rot);
 					for (int x = 0; x < objectCountSqrt; ++x)
 					{
 						for (int z = 0; z < objectCountSqrt; ++z)
@@ -2326,12 +2345,13 @@ int main()
 // 							return EXIT_FAILURE;
 // 						}
 						path = "Resources/Models/Dragon.obj";
-						uint32_t r = ImportMesh(path, L"Bunny", 
-							bunnyMesh.MeshletBuffer, bunnyMesh.MeshletVertexIndexBuffer,
-							bunnyMesh.MeshletTriangleIndexBuffer,
-							bunnyMesh.VertexBuffers, bunnyMesh.VertexBufferViews,
-							bunnyMesh.IndexBuffer, bunnyMesh.IndexBufferView,
-							bunnyMesh.IndexCount, bunnyMesh.NumMeshlets
+						uint32_t r = ImportMesh(
+							path, L"Dragon", 
+							dragonMesh.MeshletBuffer, dragonMesh.MeshletVertexIndexBuffer,
+							dragonMesh.MeshletTriangleIndexBuffer,
+							dragonMesh.VertexBuffers, dragonMesh.VertexBufferViews,
+							dragonMesh.IndexBuffer, dragonMesh.IndexBufferView,
+							dragonMesh.IndexCount, dragonMesh.NumMeshlets
 						);
 
 						if (r == EXIT_FAILURE)
@@ -2738,18 +2758,23 @@ int main()
 				{
 					if (glfwGetKey(window, GLFW_KEY_ESCAPE) == GLFW_PRESS)
 						glfwSetWindowShouldClose(window, true);
+					
+					float moveSpeed = cameraMoveSpeed;
+					if (glfwGetKey(window, GLFW_KEY_LEFT_SHIFT) == GLFW_PRESS)
+						moveSpeed = cameraMoveSpeedFast;
+
 					if (glfwGetKey(window, GLFW_KEY_D) == GLFW_PRESS)
-						cameraTr.position += fixedTime * cameraMoveSpeed * cameraTr.Right();
+						cameraTr.position += fixedTime * moveSpeed * cameraTr.Right();
 					if (glfwGetKey(window, GLFW_KEY_A) == GLFW_PRESS)
-						cameraTr.position -= fixedTime * cameraMoveSpeed * cameraTr.Right();
+						cameraTr.position -= fixedTime * moveSpeed * cameraTr.Right();
 					if (glfwGetKey(window, GLFW_KEY_Q) == GLFW_PRESS)
-						cameraTr.position += fixedTime * cameraMoveSpeed * cameraTr.Up();
+						cameraTr.position += fixedTime * moveSpeed * cameraTr.Up();
 					if (glfwGetKey(window, GLFW_KEY_E) == GLFW_PRESS)
-						cameraTr.position -= fixedTime * cameraMoveSpeed * cameraTr.Up();
+						cameraTr.position -= fixedTime * moveSpeed * cameraTr.Up();
 					if (glfwGetKey(window, GLFW_KEY_W) == GLFW_PRESS)
-						cameraTr.position += fixedTime * cameraMoveSpeed * cameraTr.Forward();
+						cameraTr.position += fixedTime * moveSpeed * cameraTr.Forward();
 					if (glfwGetKey(window, GLFW_KEY_S) == GLFW_PRESS)
-						cameraTr.position -= fixedTime * cameraMoveSpeed * cameraTr.Forward();
+						cameraTr.position -= fixedTime * moveSpeed * cameraTr.Forward();
 
 					double mouseX = 0.0f;
 					double mouseY = 0.0f;
@@ -2817,7 +2842,7 @@ int main()
 					cameraUBO.view = cameraTr.Matrix();
 					const SA::Mat4f perspective = SA::Mat4f::MakePerspective(cameraFOV, float(windowSize.x) / float(windowSize.y), cameraNear, cameraFar);
 					cameraUBO.invViewProj = perspective * cameraUBO.view.GetInversed();
-
+					cameraUBO.position = cameraTr.position;
 					// Memory mapping and Upload (CPU to GPU transfer).
 					const D3D12_RANGE range{ .Begin = 0, .End = 0 };
 					void* data = nullptr;
@@ -2921,6 +2946,7 @@ int main()
 						///* 0008-U */
 						//cmd->SetPipelineState(litPipelineState.Get());
 
+
 						//// Draw Sphere
 						//cmd->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 						//cmd->IASetVertexBuffers(0, static_cast<UINT>(sphereMesh.VertexBufferViews.size()), sphereMesh.VertexBufferViews.data());
@@ -2930,47 +2956,28 @@ int main()
 
 					// Meshlet Pipeline
 					{
-					//#define ROOT_SIG "CBV(b0), \
-									  //CBV(b1), \
-									  //SRV(t0), \
-									  //SRV(t1), \
-									  //SRV(t2), \
-									  //SRV(t3), \
-									  //SRV(t4), \
-									  //SRV(t5), \
-									  //SRV(t6)"
-						//ConstantBuffer<Camera>          cameraBuffer : register(b0);
-						//ConstantBuffer<Object>          objectBuffer : register(b1);
-
-						//StructuredBuffer<float3>        vertices : register(t0);
-						//StructuredBuffer<float3>        normals : register(t1);
-						//StructuredBuffer<float3>        tangents : register(t2);
-						//StructuredBuffer<float2>        uvs : register(t3);
-
-						//StructuredBuffer<MeshletData>   meshlets : register(t4);
-						//StructuredBuffer<uint>          meshletVertexIndices : register(t5);
-						//StructuredBuffer<uint>          meshletTriangleIndices : register(t6);
-
 						cmd->SetGraphicsRootSignature(meshletRootSig.Get());
 						cmd->SetGraphicsRootConstantBufferView(0, cameraBuffer->GetGPUVirtualAddress());
-						cmd->SetGraphicsRootShaderResourceView(1, otherObjectBuffer->GetGPUVirtualAddress());
+						cmd->SetGraphicsRoot32BitConstant(1, (uint32_t)dragonMesh.NumMeshlets, 0);
+						cmd->SetGraphicsRoot32BitConstant(1, (uint32_t)1, 1);
+						cmd->SetGraphicsRootShaderResourceView(2, otherObjectBuffer->GetGPUVirtualAddress());
 
-						cmd->SetGraphicsRootShaderResourceView(2, bunnyMesh.VertexBuffers[0]->GetGPUVirtualAddress());
+						cmd->SetGraphicsRootShaderResourceView(3, dragonMesh.VertexBuffers[0]->GetGPUVirtualAddress());
 
-						if (bunnyMesh.VertexBuffers[1] != nullptr)
-							cmd->SetGraphicsRootShaderResourceView(3, bunnyMesh.VertexBuffers[1]->GetGPUVirtualAddress());
+						if (dragonMesh.VertexBuffers[1] != nullptr)
+							cmd->SetGraphicsRootShaderResourceView(4, dragonMesh.VertexBuffers[1]->GetGPUVirtualAddress());
 
-						if (bunnyMesh.VertexBuffers[2] != nullptr)
-							cmd->SetGraphicsRootShaderResourceView(4, bunnyMesh.VertexBuffers[2]->GetGPUVirtualAddress());
+						if (dragonMesh.VertexBuffers[2] != nullptr)
+							cmd->SetGraphicsRootShaderResourceView(5, dragonMesh.VertexBuffers[2]->GetGPUVirtualAddress());
 
-						if (bunnyMesh.VertexBuffers[3] != nullptr)
-							cmd->SetGraphicsRootShaderResourceView(5, bunnyMesh.VertexBuffers[3]->GetGPUVirtualAddress());
+						if (dragonMesh.VertexBuffers[3] != nullptr)
+							cmd->SetGraphicsRootShaderResourceView(6, dragonMesh.VertexBuffers[3]->GetGPUVirtualAddress());
 
-						cmd->SetGraphicsRootShaderResourceView(6, bunnyMesh.MeshletBuffer->GetGPUVirtualAddress());
-						cmd->SetGraphicsRootShaderResourceView(7, bunnyMesh.MeshletVertexIndexBuffer->GetGPUVirtualAddress());
-						cmd->SetGraphicsRootShaderResourceView(8, bunnyMesh.MeshletTriangleIndexBuffer->GetGPUVirtualAddress());
+						cmd->SetGraphicsRootShaderResourceView(7, dragonMesh.MeshletBuffer->GetGPUVirtualAddress());
+						cmd->SetGraphicsRootShaderResourceView(8, dragonMesh.MeshletVertexIndexBuffer->GetGPUVirtualAddress());
+						cmd->SetGraphicsRootShaderResourceView(9, dragonMesh.MeshletTriangleIndexBuffer->GetGPUVirtualAddress());
 						cmd->SetPipelineState(meshletPipelineState.Get());
-						cmd->DispatchMesh((uint32_t)bunnyMesh.NumMeshlets, objectCount, 1);
+						cmd->DispatchMesh(((uint32_t)dragonMesh.NumMeshlets * 1 + 31) / 32, 1, 1);
 					}
 
 					// Manage RenderTargets for present. 0006-U2
@@ -3060,7 +3067,7 @@ int main()
 					// Sphere
 					{
 						DestroyMesh(sphereMesh);
-						DestroyMesh(bunnyMesh);
+						DestroyMesh(dragonMesh);
 					}
 				}
 			}
