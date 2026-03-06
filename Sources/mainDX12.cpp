@@ -396,16 +396,28 @@ MComPtr<ID3D12PipelineState> meshletPipelineState;
 
 MComPtr<ID3D12DescriptorHeap> pbrSphereSRVHeap;
 
+struct FrustumPlane
+{
+    SA::Vec3f normal;
+	float     padding;
+    SA::Vec3f position;
+    float     padding2;
+};
 // = Camera Buffer =
 struct CameraUBO
 {
-	SA::Mat4f view;
-	SA::Mat4f invViewProj;
-	SA::Vec3f position;
+    SA::Mat4f    view;
+    SA::Mat4f    invViewProj;
+    FrustumPlane frustumPlanes[6];
+    FrustumPlane oldFrustumPlanes[6];
+    SA::Vec3f    position;
+    uint32_t     useOldPlanes;
 };
+CameraUBO cameraUBO;
+
 SA::TransformPRf cameraTr;
 constexpr float cameraMoveSpeed = 10.0f;
-constexpr float cameraMoveSpeedFast = 20.0f;
+constexpr float cameraMoveSpeedFast = 40.0f;
 constexpr float cameraRotSpeed = 16.0f;
 constexpr float cameraNear = 0.1f;
 constexpr float cameraFar = 1000.0f;
@@ -420,8 +432,8 @@ struct ObjectUBO
 constexpr SA::Vec3f spherePosition(-2.0f, 0.0f, 2.0f);
 MComPtr<ID3D12Resource> sphereObjectBuffer;
 MComPtr<ID3D12Resource> otherObjectBuffer;
-constexpr uint32_t objectCount = 5 * 5;
-constexpr uint32_t objectCountSqrt = 5;
+constexpr uint32_t objectCount = 10 * 10;
+constexpr uint32_t objectCountSqrt = 10;
 
 // = PointLights Buffer =
 struct PointLightUBO
@@ -457,8 +469,8 @@ struct MeshletData
 
 //     int8_t         ConeAxis[3];
 //     int8_t         ConeCutoff;
-    SA::Vec3f       ConeAxis;
-    float           ConeCutoff;
+	SA::Vec3f       ConeAxis;
+	float           ConeCutoff;
 };
 
 #define STB_IMAGE_IMPLEMENTATION
@@ -2775,6 +2787,10 @@ int main()
 						cameraTr.position += fixedTime * moveSpeed * cameraTr.Forward();
 					if (glfwGetKey(window, GLFW_KEY_S) == GLFW_PRESS)
 						cameraTr.position -= fixedTime * moveSpeed * cameraTr.Forward();
+					if (glfwGetKey(window, GLFW_KEY_SPACE) == GLFW_PRESS)
+                        cameraUBO.useOldPlanes = (uint32_t)true;
+					else
+                        cameraUBO.useOldPlanes = (uint32_t)false;
 
 					double mouseX = 0.0f;
 					double mouseY = 0.0f;
@@ -2833,23 +2849,87 @@ int main()
 				}
 			#pragma endregion
 
+				auto buildPlane = [](const SA::Vec3f& a, const SA::Vec3f& b, const SA::Vec3f& c, const SA::Vec3f& frustumCenter) -> auto
+					{
+						SA::Vec3f n = (SA::Vec3f::Cross((b - a), (c - a))).GetNormalized();
+
+						if (SA::Vec3f::Dot(n, frustumCenter - a) < 0.0f)
+							n = -n;
+
+						return FrustumPlane{ n, 0, a, 0 };
+					};
 			#pragma region Update camera
 				// Update camera.
 				auto cameraBuffer = cameraBuffers[swapchainFrameIndex];
 				{
 					// Fill Data with updated values.
-					CameraUBO cameraUBO;
 					cameraUBO.view = cameraTr.Matrix();
 					const SA::Mat4f perspective = SA::Mat4f::MakePerspective(cameraFOV, float(windowSize.x) / float(windowSize.y), cameraNear, cameraFar);
 					cameraUBO.invViewProj = perspective * cameraUBO.view.GetInversed();
+					auto invViewInvProj = cameraUBO.view * (perspective).GetInversed();
 					cameraUBO.position = cameraTr.position;
-					// Memory mapping and Upload (CPU to GPU transfer).
-					const D3D12_RANGE range{ .Begin = 0, .End = 0 };
-					void* data = nullptr;
 
-					cameraBuffer->Map(0, &range, reinterpret_cast<void**>(&data));
-					std::memcpy(data, &cameraUBO, sizeof(CameraUBO));
-					cameraBuffer->Unmap(0, nullptr);
+					std::array<SA::Vec4f, 8> frustumCorners{};
+					frustumCorners[0] = invViewInvProj * SA::Vec4f{ -1.0f,  1.0f,  0.0f, 1.0f }; // near top left
+					frustumCorners[1] = invViewInvProj * SA::Vec4f{  1.0f,  1.0f,  0.0f, 1.0f }; // near top right
+					frustumCorners[2] = invViewInvProj * SA::Vec4f{ -1.0f, -1.0f,  0.0f, 1.0f }; // near bottom left
+					frustumCorners[3] = invViewInvProj * SA::Vec4f{  1.0f, -1.0f,  0.0f, 1.0f }; // near bottom right
+					frustumCorners[4] = invViewInvProj * SA::Vec4f{ -1.0f,  1.0f,  1.0f, 1.0f }; // far top left
+					frustumCorners[5] = invViewInvProj * SA::Vec4f{  1.0f,  1.0f,  1.0f, 1.0f }; // far top right
+					frustumCorners[6] = invViewInvProj * SA::Vec4f{ -1.0f, -1.0f,  1.0f, 1.0f }; // far bottom left
+					frustumCorners[7] = invViewInvProj * SA::Vec4f{  1.0f, -1.0f,  1.0f, 1.0f }; // far bottom right
+
+					for (uint32_t i = 0; i < 8; ++i)
+					{
+						frustumCorners[i].x /= frustumCorners[i].w;
+						frustumCorners[i].y /= frustumCorners[i].w;
+						frustumCorners[i].z /= frustumCorners[i].w;
+                    }
+                    auto toVec3 = [](const SA::Vec4f& v) { return SA::Vec3f{ v.x, v.y, v.z }; };
+                    const SA::Vec3f nearTopLeft = toVec3(frustumCorners[0]);
+					const SA::Vec3f nearTopRight = toVec3(frustumCorners[1]);
+					const SA::Vec3f nearBottomLeft = toVec3(frustumCorners[2]);
+					const SA::Vec3f nearBottomRight = toVec3(frustumCorners[3]);
+
+                    const SA::Vec3f farTopLeft = toVec3(frustumCorners[4]);
+					const SA::Vec3f farTopRight = toVec3(frustumCorners[5]);
+					const SA::Vec3f farBottomLeft = toVec3(frustumCorners[6]);
+					const SA::Vec3f farBottomRight = toVec3(frustumCorners[7]);
+
+					SA::Vec3f center =
+						(nearTopLeft + nearTopRight + nearBottomLeft + nearBottomRight +
+						 farTopLeft + farTopRight + farBottomLeft + farBottomRight) * 0.125f;
+
+					// left
+                    cameraUBO.frustumPlanes[0] = buildPlane(nearTopLeft,    nearBottomLeft,  farBottomLeft,  center);
+					// right
+                    cameraUBO.frustumPlanes[1] = buildPlane(nearTopRight,   nearBottomRight, farBottomRight, center);
+					// top
+                    cameraUBO.frustumPlanes[2] = buildPlane(nearTopLeft,    nearTopRight,    farTopRight,    center);
+					// bottom
+                    cameraUBO.frustumPlanes[3] = buildPlane(nearBottomLeft, farBottomLeft,   farBottomRight, center);
+					// near
+                    cameraUBO.frustumPlanes[4] = buildPlane(nearTopLeft,    nearBottomRight, nearTopRight,   center);
+					// far
+                    cameraUBO.frustumPlanes[5] = buildPlane(farTopLeft,     farTopRight, farBottomRight, center);
+
+					if (cameraUBO.useOldPlanes == false)
+					{
+                        cameraUBO.oldFrustumPlanes[0] = cameraUBO.frustumPlanes[0];
+                        cameraUBO.oldFrustumPlanes[1] = cameraUBO.frustumPlanes[1];
+                        cameraUBO.oldFrustumPlanes[2] = cameraUBO.frustumPlanes[2];
+                        cameraUBO.oldFrustumPlanes[3] = cameraUBO.frustumPlanes[3];
+                        cameraUBO.oldFrustumPlanes[4] = cameraUBO.frustumPlanes[4];
+                        cameraUBO.oldFrustumPlanes[5] = cameraUBO.frustumPlanes[5];
+					}
+
+                    // Memory mapping and Upload (CPU to GPU transfer).
+                    const D3D12_RANGE range{ .Begin = 0, .End = 0 };
+                    void* data = nullptr;
+
+                    cameraBuffer->Map(0, &range, reinterpret_cast<void**>(&data));
+                    std::memcpy(data, &cameraUBO, sizeof(CameraUBO));
+                    cameraBuffer->Unmap(0, nullptr);
 				}
 			#pragma endregion
 
@@ -2959,7 +3039,7 @@ int main()
 						cmd->SetGraphicsRootSignature(meshletRootSig.Get());
 						cmd->SetGraphicsRootConstantBufferView(0, cameraBuffer->GetGPUVirtualAddress());
 						cmd->SetGraphicsRoot32BitConstant(1, (uint32_t)dragonMesh.NumMeshlets, 0);
-						cmd->SetGraphicsRoot32BitConstant(1, (uint32_t)1, 1);
+						cmd->SetGraphicsRoot32BitConstant(1, (uint32_t)objectCount, 1);
 						cmd->SetGraphicsRootShaderResourceView(2, otherObjectBuffer->GetGPUVirtualAddress());
 
 						cmd->SetGraphicsRootShaderResourceView(3, dragonMesh.VertexBuffers[0]->GetGPUVirtualAddress());
@@ -2977,7 +3057,7 @@ int main()
 						cmd->SetGraphicsRootShaderResourceView(8, dragonMesh.MeshletVertexIndexBuffer->GetGPUVirtualAddress());
 						cmd->SetGraphicsRootShaderResourceView(9, dragonMesh.MeshletTriangleIndexBuffer->GetGPUVirtualAddress());
 						cmd->SetPipelineState(meshletPipelineState.Get());
-						cmd->DispatchMesh(((uint32_t)dragonMesh.NumMeshlets * 1 + 31) / 32, 1, 1);
+						cmd->DispatchMesh(((uint32_t)dragonMesh.NumMeshlets * (uint32_t)objectCount + 31) / 32, 1, 1);
 					}
 
 					// Manage RenderTargets for present. 0006-U2

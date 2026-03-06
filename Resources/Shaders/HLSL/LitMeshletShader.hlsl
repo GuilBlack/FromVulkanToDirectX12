@@ -25,6 +25,14 @@ struct VertexOutput
     float2 uv : TEXCOORD0;
 };
 
+struct FrustumPlane
+{
+    float3 normal;
+    float __pad0;
+    float3 position;
+    float __pad1;
+};
+
 struct Camera
 {
     /// Camera transformation matrix.
@@ -35,7 +43,10 @@ struct Camera
     *	projection * inverseView.
     */
     float4x4 invViewProj;
+    FrustumPlane planes[6];
+    FrustumPlane oldPlanes[6];
     float3 position;
+    uint useOldPlanes;
 };
 
 struct Object
@@ -82,6 +93,11 @@ StructuredBuffer<uint>          meshletTriangleIndices : register(t6);
 //     coneCutoff = int((coneInfo >> 24) & 0xFF) / 127.0;
 // }
 
+float DistToPlane(float3 planeNormal, float3 planePoint, float3 p)
+{
+    return dot(normalize(planeNormal), p - planePoint);
+}
+
 bool IsMeshletVisible(MeshletData m, float4x4 world)
 {
     float3 coneAxis = m.ConeAxis;
@@ -90,8 +106,25 @@ bool IsMeshletVisible(MeshletData m, float4x4 world)
     float3 worldCenter = mul(world, float4(m.BoundsCenter, 1)).xyz;
     float3 worldConeAxis = normalize(mul(world, float4(coneAxis, 0))).xyz;
 
-    bool shouldCull = dot(worldCenter - cameraBuffer.position, worldConeAxis) >= coneCutoff * length(worldCenter - cameraBuffer.position) + m.BoundsRadius;
-    return !shouldCull;
+    bool isBackFacing = dot(worldCenter - cameraBuffer.position, worldConeAxis) >= coneCutoff * length(worldCenter - cameraBuffer.position) + m.BoundsRadius;
+
+    bool isInFrustum = true;
+    for (int i = 0; i < 6; ++i)
+    {
+        float d;
+        if (cameraBuffer.useOldPlanes != 0)
+            d = DistToPlane(cameraBuffer.oldPlanes[i].normal, cameraBuffer.oldPlanes[i].position, worldCenter);
+        else
+            d = DistToPlane(cameraBuffer.planes[i].normal, cameraBuffer.planes[i].position, worldCenter);
+
+        if (d < -m.BoundsRadius)
+        {
+            isInFrustum = false;
+            break;
+        }
+    }
+
+    return !isBackFacing && isInFrustum;
 }
 
 struct Payload
