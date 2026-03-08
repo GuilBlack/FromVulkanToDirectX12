@@ -299,6 +299,7 @@ MComPtr<ID3DBlob> Native_CompileShader(std::wstring _path, std::string _entry, s
 #include <dxc/dxcapi.h>
 MComPtr<IDxcUtils> shaderCompilerUtils;
 MComPtr<IDxcCompiler3> shaderCompiler;
+MComPtr<IDxcIncludeHandler> shaderIncludeHandler;
 MComPtr<ID3DBlob> CompileShader(std::wstring _path, std::wstring _entry, std::wstring _target, std::vector<std::wstring> _defines = {})
 {
 	MComPtr<IDxcBlobEncoding> blob;
@@ -328,8 +329,8 @@ MComPtr<ID3DBlob> CompileShader(std::wstring _path, std::wstring _entry, std::ws
 		DXC_ARG_PACK_MATRIX_ROW_MAJOR,
 		DXC_ARG_ALL_RESOURCES_BOUND,
 		/* Add include path for shader includer (Warning: must work both from VS and standalone .exe) */
-		//L"-I",
-		//L"/Resources/Shaders/HLSL"
+		L"-I",
+		L"Resources/Shaders/HLSL"
 	};
 
 #if SA_DEBUG
@@ -351,7 +352,7 @@ MComPtr<ID3DBlob> CompileShader(std::wstring _path, std::wstring _entry, std::ws
 
 
 	MComPtr<IDxcResult> result;
-	shaderCompiler->Compile(&dx, cArgs.data(), static_cast<uint32_t>(cArgs.size()), nullptr /*&includer*/, IID_PPV_ARGS(&result));
+	shaderCompiler->Compile(&dx, cArgs.data(), static_cast<uint32_t>(cArgs.size()), shaderIncludeHandler.Get(), IID_PPV_ARGS(&result));
 
 	HRESULT hr;
 	result->GetStatus(&hr);
@@ -398,20 +399,20 @@ MComPtr<ID3D12DescriptorHeap> pbrSphereSRVHeap;
 
 struct FrustumPlane
 {
-    SA::Vec3f normal;
+	SA::Vec3f normal;
 	float     padding;
-    SA::Vec3f position;
-    float     padding2;
+	SA::Vec3f position;
+	float     padding2;
 };
 // = Camera Buffer =
 struct CameraUBO
 {
-    SA::Mat4f    view;
-    SA::Mat4f    invViewProj;
-    FrustumPlane frustumPlanes[6];
-    FrustumPlane oldFrustumPlanes[6];
-    SA::Vec3f    position;
-    uint32_t     useOldPlanes;
+	SA::Mat4f    view;
+	SA::Mat4f    invViewProj;
+	FrustumPlane frustumPlanes[6];
+	FrustumPlane oldFrustumPlanes[6];
+	SA::Vec3f    position;
+	uint32_t     useOldPlanes;
 };
 CameraUBO cameraUBO;
 
@@ -665,7 +666,7 @@ bool SubmitTextureToGPU(MComPtr<ID3D12Resource> _gpuTexture, const std::vector<S
 
 void GenerateMipMapsCPU(SA::Vec2ui _extent, std::vector<char>& _data, uint32_t& _outMipLevels, uint32_t& _outTotalSize, std::vector<SA::Vec2ui>& _outExtents, uint32_t _channelNum, uint32_t _layerNum = 1u)
 {
-	_outMipLevels = static_cast<uint32_t>(std::floor(std::log2(max(_extent.x, _extent.y)))) + 1;
+	_outMipLevels = static_cast<uint32_t>(std::floor(std::log2(std::max(_extent.x, _extent.y)))) + 1;
 
 	_outExtents.resize(_outMipLevels);
 
@@ -1687,6 +1688,12 @@ int main()
 					if (FAILED(hCreateInstance))
 					{
 						SA_LOG(L"Create DXC Shader Compiler Instance failed!", Error, DXC, (L"Error Code: %1", hCreateInstance));
+						return EXIT_FAILURE;
+					}
+					const HRESULT hCreateIncludeHandler = shaderCompilerUtils->CreateDefaultIncludeHandler(&shaderIncludeHandler);
+					if (FAILED(hCreateIncludeHandler))
+					{
+						SA_LOG(L"Create DXC Shader Include Handler failed!", Error, DXC, (L"Error Code: %1", hCreateIncludeHandler));
 						return EXIT_FAILURE;
 					}
 				}
@@ -2739,6 +2746,7 @@ int main()
 
 
 	// Loop
+#pragma region Main Loop
 	if (true)
 	{
 		double oldMouseX = 0.0f;
@@ -2788,9 +2796,9 @@ int main()
 					if (glfwGetKey(window, GLFW_KEY_S) == GLFW_PRESS)
 						cameraTr.position -= fixedTime * moveSpeed * cameraTr.Forward();
 					if (glfwGetKey(window, GLFW_KEY_SPACE) == GLFW_PRESS)
-                        cameraUBO.useOldPlanes = (uint32_t)true;
+						cameraUBO.useOldPlanes = (uint32_t)true;
 					else
-                        cameraUBO.useOldPlanes = (uint32_t)false;
+						cameraUBO.useOldPlanes = (uint32_t)false;
 
 					double mouseX = 0.0f;
 					double mouseY = 0.0f;
@@ -2884,14 +2892,14 @@ int main()
 						frustumCorners[i].x /= frustumCorners[i].w;
 						frustumCorners[i].y /= frustumCorners[i].w;
 						frustumCorners[i].z /= frustumCorners[i].w;
-                    }
-                    auto toVec3 = [](const SA::Vec4f& v) { return SA::Vec3f{ v.x, v.y, v.z }; };
-                    const SA::Vec3f nearTopLeft = toVec3(frustumCorners[0]);
+					}
+					auto toVec3 = [](const SA::Vec4f& v) { return SA::Vec3f{ v.x, v.y, v.z }; };
+					const SA::Vec3f nearTopLeft = toVec3(frustumCorners[0]);
 					const SA::Vec3f nearTopRight = toVec3(frustumCorners[1]);
 					const SA::Vec3f nearBottomLeft = toVec3(frustumCorners[2]);
 					const SA::Vec3f nearBottomRight = toVec3(frustumCorners[3]);
 
-                    const SA::Vec3f farTopLeft = toVec3(frustumCorners[4]);
+					const SA::Vec3f farTopLeft = toVec3(frustumCorners[4]);
 					const SA::Vec3f farTopRight = toVec3(frustumCorners[5]);
 					const SA::Vec3f farBottomLeft = toVec3(frustumCorners[6]);
 					const SA::Vec3f farBottomRight = toVec3(frustumCorners[7]);
@@ -2901,35 +2909,35 @@ int main()
 						 farTopLeft + farTopRight + farBottomLeft + farBottomRight) * 0.125f;
 
 					// left
-                    cameraUBO.frustumPlanes[0] = buildPlane(nearTopLeft,    nearBottomLeft,  farBottomLeft,  center);
+					cameraUBO.frustumPlanes[0] = buildPlane(nearTopLeft,    nearBottomLeft,  farBottomLeft,  center);
 					// right
-                    cameraUBO.frustumPlanes[1] = buildPlane(nearTopRight,   nearBottomRight, farBottomRight, center);
+					cameraUBO.frustumPlanes[1] = buildPlane(nearTopRight,   nearBottomRight, farBottomRight, center);
 					// top
-                    cameraUBO.frustumPlanes[2] = buildPlane(nearTopLeft,    nearTopRight,    farTopRight,    center);
+					cameraUBO.frustumPlanes[2] = buildPlane(nearTopLeft,    nearTopRight,    farTopRight,    center);
 					// bottom
-                    cameraUBO.frustumPlanes[3] = buildPlane(nearBottomLeft, farBottomLeft,   farBottomRight, center);
+					cameraUBO.frustumPlanes[3] = buildPlane(nearBottomLeft, farBottomLeft,   farBottomRight, center);
 					// near
-                    cameraUBO.frustumPlanes[4] = buildPlane(nearTopLeft,    nearBottomRight, nearTopRight,   center);
+					cameraUBO.frustumPlanes[4] = buildPlane(nearTopLeft,    nearBottomRight, nearTopRight,   center);
 					// far
-                    cameraUBO.frustumPlanes[5] = buildPlane(farTopLeft,     farTopRight, farBottomRight, center);
+					cameraUBO.frustumPlanes[5] = buildPlane(farTopLeft,     farTopRight, farBottomRight, center);
 
 					if (cameraUBO.useOldPlanes == false)
 					{
-                        cameraUBO.oldFrustumPlanes[0] = cameraUBO.frustumPlanes[0];
-                        cameraUBO.oldFrustumPlanes[1] = cameraUBO.frustumPlanes[1];
-                        cameraUBO.oldFrustumPlanes[2] = cameraUBO.frustumPlanes[2];
-                        cameraUBO.oldFrustumPlanes[3] = cameraUBO.frustumPlanes[3];
-                        cameraUBO.oldFrustumPlanes[4] = cameraUBO.frustumPlanes[4];
-                        cameraUBO.oldFrustumPlanes[5] = cameraUBO.frustumPlanes[5];
+						cameraUBO.oldFrustumPlanes[0] = cameraUBO.frustumPlanes[0];
+						cameraUBO.oldFrustumPlanes[1] = cameraUBO.frustumPlanes[1];
+						cameraUBO.oldFrustumPlanes[2] = cameraUBO.frustumPlanes[2];
+						cameraUBO.oldFrustumPlanes[3] = cameraUBO.frustumPlanes[3];
+						cameraUBO.oldFrustumPlanes[4] = cameraUBO.frustumPlanes[4];
+						cameraUBO.oldFrustumPlanes[5] = cameraUBO.frustumPlanes[5];
 					}
 
-                    // Memory mapping and Upload (CPU to GPU transfer).
-                    const D3D12_RANGE range{ .Begin = 0, .End = 0 };
-                    void* data = nullptr;
+					// Memory mapping and Upload (CPU to GPU transfer).
+					const D3D12_RANGE range{ .Begin = 0, .End = 0 };
+					void* data = nullptr;
 
-                    cameraBuffer->Map(0, &range, reinterpret_cast<void**>(&data));
-                    std::memcpy(data, &cameraUBO, sizeof(CameraUBO));
-                    cameraBuffer->Unmap(0, nullptr);
+					cameraBuffer->Map(0, &range, reinterpret_cast<void**>(&data));
+					std::memcpy(data, &cameraUBO, sizeof(CameraUBO));
+					cameraBuffer->Unmap(0, nullptr);
 				}
 			#pragma endregion
 
@@ -3110,9 +3118,11 @@ int main()
 			SA_LOG_END_OF_FRAME();
 		}
 	}
+#pragma endregion
 
 
 	// Uninitialization
+#pragma region Uninitialization
 	if(true)
 	{
 	#pragma region Uninitialization Renderer
@@ -3235,6 +3245,7 @@ int main()
 
 				shaderCompiler.Reset();
 				shaderCompilerUtils.Reset();
+				shaderIncludeHandler.Reset();
 			}
 
 
@@ -3361,6 +3372,7 @@ int main()
 			glfwTerminate();
 		}
 	}
+#pragma endregion
 
 	return 0;
 }
