@@ -44,7 +44,7 @@ struct Cluster
 	uint32_t     Padding;
 };
 
-ConstantBuffer<Camera>          cameraBuffer : register(b0);
+ConstantBuffer<Scene>          sceneBuffer : register(b0);
 ConstantBuffer<PushConstants>   pushConstants : register(b1);
 StructuredBuffer<Object>        objectBuffer : register(t7);
 
@@ -57,35 +57,25 @@ StructuredBuffer<Cluster>       meshlets : register(t4);
 StructuredBuffer<uint>          meshletVertexIndices : register(t5);
 StructuredBuffer<uint>          meshletTriangleIndices : register(t6);
 
-// void GetConeData(MeshletData m, out float3 coneAxis, out float coneCutoff)
-// {
-//     uint coneInfo = m.ConeInfo;
-//     coneAxis = float3(
-//         int((coneInfo >> 0) & 0xFF) / 127.0,
-//         int((coneInfo >> 8) & 0xFF) / 127.0,
-//         int((coneInfo >> 16) & 0xFF) / 127.0);
-//     coneCutoff = int((coneInfo >> 24) & 0xFF) / 127.0;
-// }
-
 float DistToPlane(float3 planeNormal, float3 planePoint, float3 p)
 {
     return dot(normalize(planeNormal), p - planePoint);
 }
 
-bool IsMeshletVisible(Cluster m, float4x4 world)
+bool IsMeshletVisible(Cluster c, float4x4 world)
 {
-    float3 worldCenter = mul(world, float4(m.Center, 1)).xyz;
+    float3 worldCenter = mul(world, float4(c.Center, 1)).xyz;
 
     bool isInFrustum = true;
     for (int i = 0; i < 6; ++i)
     {
         float d;
-        if (cameraBuffer.useOldPlanes != 0)
-            d = DistToPlane(cameraBuffer.oldPlanes[i].normal, cameraBuffer.oldPlanes[i].position, worldCenter);
+        if (sceneBuffer.useOldPlanes != 0)
+            d = DistToPlane(sceneBuffer.oldPlanes[i].normal, sceneBuffer.oldPlanes[i].position, worldCenter);
         else
-            d = DistToPlane(cameraBuffer.planes[i].normal, cameraBuffer.planes[i].position, worldCenter);
+            d = DistToPlane(sceneBuffer.planes[i].normal, sceneBuffer.planes[i].position, worldCenter);
 
-        if (d < -m.Radius)
+        if (d < -c.Radius)
         {
             isInFrustum = false;
             break;
@@ -117,8 +107,8 @@ void mainAS(
     if (meshletIndex < pushConstants.NumClusters + pushConstants.ClustersStart && instanceIndex < pushConstants.NumInstances)
     {
         float4x4 world = objectBuffer[instanceIndex].transform;
-        Cluster m = meshlets[meshletIndex];
-        visibility = IsMeshletVisible(m, world);
+        Cluster c = meshlets[meshletIndex];
+        visibility = IsMeshletVisible(c, world);
     }
     // https://github.com/microsoft/directxshadercompiler/wiki/wave-intrinsics
     if (visibility)
@@ -199,7 +189,7 @@ void mainMS(
     uint instanceIndex = payload.InstanceIndices[gid];
     uint meshletIndex = payload.MeshletIndices[gid];
 
-    Cluster m = meshlets[meshletIndex];
+    Cluster c = meshlets[meshletIndex];
     float4x4 world = objectBuffer[instanceIndex].transform;
 
 #if DEBUG_CLUSTER_BOUNDS
@@ -213,10 +203,10 @@ void mainMS(
 
     if (gtid.x < DEBUG_BOUND_VERT_COUNT)
     {
-        float3 localPos = m.Center + kDebugBoundVerts[gtid.x] * m.Radius;
+        float3 localPos = c.Center + kDebugBoundVerts[gtid.x] * c.Radius;
         float4 worldPos = mul(world, float4(localPos, 1.0));
 
-        verts[gtid.x].svPosition = mul(cameraBuffer.invViewProj, worldPos);
+        verts[gtid.x].svPosition = mul(sceneBuffer.invViewProj, worldPos);
         verts[gtid.x].worldPosition = worldPos.xyz;
         verts[gtid.x].color = HashColor(meshletIndex);
         verts[gtid.x].uv = float2(0.0, 0.0);
@@ -224,11 +214,11 @@ void mainMS(
 
 #else
 
-    SetMeshOutputCounts(m.VertexCount, m.TriangleCount);
+    SetMeshOutputCounts(c.VertexCount, c.TriangleCount);
 
-    if (gtid.x < m.TriangleCount)
+    if (gtid.x < c.TriangleCount)
     {
-        uint triangleInd = m.TriangleStart + (gtid.x * 3);
+        uint triangleInd = c.TriangleStart + (gtid.x * 3);
         uint3 tri;
         tri.x = meshletTriangleIndices[triangleInd + 0];
         tri.y = meshletTriangleIndices[triangleInd + 1];
@@ -236,14 +226,15 @@ void mainMS(
         tris[gtid.x] = tri;
     }
 
-    if (gtid.x < m.VertexCount)
+    if (gtid.x < c.VertexCount)
     {
-        uint vertexIndex = meshletVertexIndices[m.VertexStart + gtid.x];
+        uint vertexIndex = meshletVertexIndices[c.VertexStart + gtid.x];
         float4 worldPosition = mul(world, float4(vertices[vertexIndex], 1.0));
 
-        verts[gtid.x].svPosition = mul(cameraBuffer.invViewProj, worldPosition);
+        verts[gtid.x].svPosition = mul(sceneBuffer.invViewProj, worldPosition);
         verts[gtid.x].worldPosition = worldPosition.xyz;
-        verts[gtid.x].color = HashColor(meshletIndex);
+        uint colorId = sceneBuffer.debugGroups ? c.GroupIndex : meshletIndex;
+        verts[gtid.x].color = HashColor(colorId);
         verts[gtid.x].uv = float2(0.0, 0.0);
     }
 

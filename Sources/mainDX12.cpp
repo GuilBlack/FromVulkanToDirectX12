@@ -412,16 +412,17 @@ struct FrustumPlane
 	float     padding2;
 };
 // = Camera Buffer =
-struct CameraUBO
+struct SceneUBO
 {
 	SA::Mat4f    view;
 	SA::Mat4f    invViewProj;
 	FrustumPlane frustumPlanes[6];
 	FrustumPlane oldFrustumPlanes[6];
 	SA::Vec3f    position;
-	uint32_t     useOldPlanes;
+    uint32_t     useOldPlanes{};
+	uint32_t     debugGroups{};
 };
-CameraUBO cameraUBO;
+SceneUBO sceneUBO;
 
 SA::TransformPRf cameraTr;
 constexpr float cameraMoveSpeed = 10.0f;
@@ -430,7 +431,7 @@ constexpr float cameraRotSpeed = 16.0f;
 constexpr float cameraNear = 0.1f;
 constexpr float cameraFar = 1000.0f;
 constexpr float cameraFOV = 90.0f;
-std::array<MComPtr<ID3D12Resource>, bufferingCount> cameraBuffers;
+std::array<MComPtr<ID3D12Resource>, bufferingCount> sceneBuffers;
 
 // = Object Buffer =
 struct ObjectUBO
@@ -2639,7 +2640,7 @@ int main()
 					const D3D12_RESOURCE_DESC desc{
 						.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER,
 						.Alignment = 0,
-						.Width = sizeof(CameraUBO),
+						.Width = sizeof(SceneUBO),
 						.Height = 1,
 						.DepthOrArraySize = 1,
 						.MipLevels = 1,
@@ -2651,7 +2652,7 @@ int main()
 
 					for (uint32_t i = 0; i < bufferingCount; ++i)
 					{
-						const HRESULT hrBufferCreated = device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&cameraBuffers[i]));
+						const HRESULT hrBufferCreated = device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&sceneBuffers[i]));
 						if (FAILED(hrBufferCreated))
 						{
 							SA_LOG((L"Create Camera Buffer [%1] failed!", i), Error, DX12, (L"Error code: %1", hrBufferCreated));
@@ -2660,9 +2661,9 @@ int main()
 						else
 						{
 							const std::wstring name = L"CameraBuffer [" + std::to_wstring(i) + L"]";
-							cameraBuffers[i]->SetName(name.c_str());
+							sceneBuffers[i]->SetName(name.c_str());
 
-							SA_LOG((L"Create Camera Buffer [%1] success", i), Info, DX12, (L"\"%1\" [%2]", name, cameraBuffers[i].Get()));
+							SA_LOG((L"Create Camera Buffer [%1] success", i), Info, DX12, (L"\"%1\" [%2]", name, sceneBuffers[i].Get()));
 						}
 					}
 				}
@@ -3286,9 +3287,13 @@ int main()
 					if (glfwGetKey(window, GLFW_KEY_S) == GLFW_PRESS)
 						cameraTr.position -= fixedTime * moveSpeed * cameraTr.Forward();
 					if (glfwGetKey(window, GLFW_KEY_SPACE) == GLFW_PRESS)
-						cameraUBO.useOldPlanes = (uint32_t)true;
+						sceneUBO.useOldPlanes = (uint32_t)true;
 					else
-						cameraUBO.useOldPlanes = (uint32_t)false;
+						sceneUBO.useOldPlanes = (uint32_t)false;
+					if (glfwGetKey(window, GLFW_KEY_G) == GLFW_PRESS)
+                        sceneUBO.debugGroups = (uint32_t)true;
+					else
+                        sceneUBO.debugGroups = (uint32_t)false;
 
 					double mouseX = 0.0f;
 					double mouseY = 0.0f;
@@ -3359,14 +3364,14 @@ int main()
 					};
 			#pragma region Update camera
 				// Update camera.
-				auto cameraBuffer = cameraBuffers[swapchainFrameIndex];
+				auto sceneBuffer = sceneBuffers[swapchainFrameIndex];
 				{
 					// Fill Data with updated values.
-					cameraUBO.view = cameraTr.Matrix();
+					sceneUBO.view = cameraTr.Matrix();
 					const SA::Mat4f perspective = SA::Mat4f::MakePerspective(cameraFOV, float(windowSize.x) / float(windowSize.y), cameraNear, cameraFar);
-					cameraUBO.invViewProj = perspective * cameraUBO.view.GetInversed();
-					auto invViewInvProj = cameraUBO.view * (perspective).GetInversed();
-					cameraUBO.position = cameraTr.position;
+					sceneUBO.invViewProj = perspective * sceneUBO.view.GetInversed();
+					auto invViewInvProj = sceneUBO.view * (perspective).GetInversed();
+					sceneUBO.position = cameraTr.position;
 
 					std::array<SA::Vec4f, 8> frustumCorners{};
 					frustumCorners[0] = invViewInvProj * SA::Vec4f{ -1.0f,  1.0f,  0.0f, 1.0f }; // near top left
@@ -3400,35 +3405,35 @@ int main()
 						 farTopLeft + farTopRight + farBottomLeft + farBottomRight) * 0.125f;
 
 					// left
-					cameraUBO.frustumPlanes[0] = buildPlane(nearTopLeft,    nearBottomLeft,  farBottomLeft,  center);
+					sceneUBO.frustumPlanes[0] = buildPlane(nearTopLeft,    nearBottomLeft,  farBottomLeft,  center);
 					// right
-					cameraUBO.frustumPlanes[1] = buildPlane(nearTopRight,   nearBottomRight, farBottomRight, center);
+					sceneUBO.frustumPlanes[1] = buildPlane(nearTopRight,   nearBottomRight, farBottomRight, center);
 					// top
-					cameraUBO.frustumPlanes[2] = buildPlane(nearTopLeft,    nearTopRight,    farTopRight,    center);
+					sceneUBO.frustumPlanes[2] = buildPlane(nearTopLeft,    nearTopRight,    farTopRight,    center);
 					// bottom
-					cameraUBO.frustumPlanes[3] = buildPlane(nearBottomLeft, farBottomLeft,   farBottomRight, center);
+					sceneUBO.frustumPlanes[3] = buildPlane(nearBottomLeft, farBottomLeft,   farBottomRight, center);
 					// near
-					cameraUBO.frustumPlanes[4] = buildPlane(nearTopLeft,    nearBottomRight, nearTopRight,   center);
+					sceneUBO.frustumPlanes[4] = buildPlane(nearTopLeft,    nearBottomRight, nearTopRight,   center);
 					// far
-					cameraUBO.frustumPlanes[5] = buildPlane(farTopLeft,     farTopRight, farBottomRight, center);
+					sceneUBO.frustumPlanes[5] = buildPlane(farTopLeft,     farTopRight, farBottomRight, center);
 
-					if (cameraUBO.useOldPlanes == false)
+					if (sceneUBO.useOldPlanes == false)
 					{
-						cameraUBO.oldFrustumPlanes[0] = cameraUBO.frustumPlanes[0];
-						cameraUBO.oldFrustumPlanes[1] = cameraUBO.frustumPlanes[1];
-						cameraUBO.oldFrustumPlanes[2] = cameraUBO.frustumPlanes[2];
-						cameraUBO.oldFrustumPlanes[3] = cameraUBO.frustumPlanes[3];
-						cameraUBO.oldFrustumPlanes[4] = cameraUBO.frustumPlanes[4];
-						cameraUBO.oldFrustumPlanes[5] = cameraUBO.frustumPlanes[5];
+						sceneUBO.oldFrustumPlanes[0] = sceneUBO.frustumPlanes[0];
+						sceneUBO.oldFrustumPlanes[1] = sceneUBO.frustumPlanes[1];
+						sceneUBO.oldFrustumPlanes[2] = sceneUBO.frustumPlanes[2];
+						sceneUBO.oldFrustumPlanes[3] = sceneUBO.frustumPlanes[3];
+						sceneUBO.oldFrustumPlanes[4] = sceneUBO.frustumPlanes[4];
+						sceneUBO.oldFrustumPlanes[5] = sceneUBO.frustumPlanes[5];
 					}
 
 					// Memory mapping and Upload (CPU to GPU transfer).
 					const D3D12_RANGE range{ .Begin = 0, .End = 0 };
 					void* data = nullptr;
 
-					cameraBuffer->Map(0, &range, reinterpret_cast<void**>(&data));
-					std::memcpy(data, &cameraUBO, sizeof(CameraUBO));
-					cameraBuffer->Unmap(0, nullptr);
+					sceneBuffer->Map(0, &range, reinterpret_cast<void**>(&data));
+					std::memcpy(data, &sceneUBO, sizeof(SceneUBO));
+					sceneBuffer->Unmap(0, nullptr);
 				}
 			#pragma endregion
 
@@ -3537,7 +3542,7 @@ int main()
 					if constexpr (renderDragonMesh)
 					{
 						cmd->SetGraphicsRootSignature(meshletRootSig.Get());
-						cmd->SetGraphicsRootConstantBufferView(0, cameraBuffer->GetGPUVirtualAddress());
+						cmd->SetGraphicsRootConstantBufferView(0, sceneBuffer->GetGPUVirtualAddress());
 						cmd->SetGraphicsRoot32BitConstant(1, (uint32_t)dragonMesh.NumMeshlets, 0);
 						cmd->SetGraphicsRoot32BitConstant(1, (uint32_t)objectCount, 1);
 						cmd->SetGraphicsRootShaderResourceView(2, otherObjectBuffer->GetGPUVirtualAddress());
@@ -3574,7 +3579,7 @@ int main()
                         }
 
                         cmd->SetGraphicsRootSignature(meshletLodDebugRootSig.Get());
-                        cmd->SetGraphicsRootConstantBufferView(0, cameraBuffer->GetGPUVirtualAddress());
+                        cmd->SetGraphicsRootConstantBufferView(0, sceneBuffer->GetGPUVirtualAddress());
 
                         cmd->SetGraphicsRoot32BitConstant(1, (uint32_t)clustersStart, 0);
                         cmd->SetGraphicsRoot32BitConstant(1, (uint32_t)numClusters, 1);
@@ -3696,8 +3701,8 @@ int main()
 				{
 					for (uint32_t i = 0; i < bufferingCount; ++i)
 					{
-						SA_LOG((L"Destroying Camera Buffer [%1]...", i), Info, DX12, cameraBuffers[i].Get());
-						cameraBuffers[i] = nullptr;
+						SA_LOG((L"Destroying Camera Buffer [%1]...", i), Info, DX12, sceneBuffers[i].Get());
+						sceneBuffers[i] = nullptr;
 					}
 				}
 

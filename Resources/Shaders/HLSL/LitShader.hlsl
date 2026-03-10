@@ -33,7 +33,7 @@ struct VertexOutput
 };
 
 //---------- Bindings ----------
-struct Camera
+struct Scene
 {
 	/// Camera transformation matrix.
 	float4x4 view;
@@ -46,7 +46,7 @@ struct Camera
 };
 cbuffer CameraBuffer : register(b0)
 {
-	Camera camera;
+	Scene camera;
 };
 
 struct Object

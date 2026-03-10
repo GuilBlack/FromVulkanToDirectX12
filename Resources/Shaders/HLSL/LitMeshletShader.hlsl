@@ -42,7 +42,7 @@ struct MeshletData
     float           ConeCutoff;
 };
 
-ConstantBuffer<Camera>          cameraBuffer : register(b0);
+ConstantBuffer<Scene>           sceneBuffer : register(b0);
 ConstantBuffer<PushConstants>   pushConstants : register(b1);
 StructuredBuffer<Object>        objectBuffer : register(t7);
 
@@ -78,16 +78,16 @@ bool IsMeshletVisible(MeshletData m, float4x4 world)
     float3 worldCenter = mul(world, float4(m.BoundsCenter, 1)).xyz;
     float3 worldConeAxis = normalize(mul(world, float4(coneAxis, 0))).xyz;
 
-    bool isBackFacing = dot(worldCenter - cameraBuffer.position, worldConeAxis) >= coneCutoff * length(worldCenter - cameraBuffer.position) + m.BoundsRadius;
+    bool isBackFacing = dot(worldCenter - sceneBuffer.camPosition, worldConeAxis) >= coneCutoff * length(worldCenter - sceneBuffer.camPosition) + m.BoundsRadius;
 
     bool isInFrustum = true;
     for (int i = 0; i < 6; ++i)
     {
         float d;
-        if (cameraBuffer.useOldPlanes != 0)
-            d = DistToPlane(cameraBuffer.oldPlanes[i].normal, cameraBuffer.oldPlanes[i].position, worldCenter);
+        if (sceneBuffer.useOldPlanes != 0)
+            d = DistToPlane(sceneBuffer.oldPlanes[i].normal, sceneBuffer.oldPlanes[i].position, worldCenter);
         else
-            d = DistToPlane(cameraBuffer.planes[i].normal, cameraBuffer.planes[i].position, worldCenter);
+            d = DistToPlane(sceneBuffer.planes[i].normal, sceneBuffer.planes[i].position, worldCenter);
 
         if (d < -m.BoundsRadius)
         {
@@ -186,7 +186,7 @@ void mainMS(
     {
         uint vertexIndex = meshletVertexIndices[m.VertexOffset + gtid.x];
         float4 worldPosition = mul(objectBuffer[instanceIndex].transform, float4(vertices[vertexIndex], 1.0));
-        verts[gtid.x].svPosition = mul(cameraBuffer.invViewProj, float4(worldPosition));
+        verts[gtid.x].svPosition = mul(sceneBuffer.invViewProj, float4(worldPosition));
         verts[gtid.x].color = HashColor(meshletIndex);
     }
 }

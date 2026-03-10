@@ -6,7 +6,7 @@ struct FrustumPlane
     float __pad1;
 };
 
-struct Camera
+struct Scene
 {
     /// Camera transformation matrix.
     float4x4 view;
@@ -18,8 +18,9 @@ struct Camera
     float4x4 invViewProj;
     FrustumPlane planes[6];
     FrustumPlane oldPlanes[6];
-    float3 position;
+    float3 camPosition;
     uint useOldPlanes;
+    uint debugGroups;
 };
 
 struct Object
