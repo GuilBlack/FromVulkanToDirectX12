@@ -17,7 +17,7 @@ set(MY_PACKAGE_OUTPUT_DIR "${CMAKE_SOURCE_DIR}/ThirdParty/packages")
 
 
 # ===== Target mainDX12 =====
-add_executable(FVTDX12_mainDX12 "Sources/mainDX12.cpp")
+add_executable(FVTDX12_mainDX12 "Sources/mainDX12.cpp" "Resources/Shaders/HLSL/CommonStructs.h")
 
 # Install Agility SDK 1.615.1 to nake sure everyone has Mesh-shader ready D3D12 dll
 # See Agility SDK documentation: https://devblogs.microsoft.com/directx/gettingstarted-dx12agility/
@@ -76,7 +76,7 @@ add_custom_command(
 find_package(Vulkan COMPONENTS shaderc_combined) # https://cmake.org/cmake/help/latest/module/FindVulkan.html
 
 if(${Vulkan_FOUND})
-    add_executable(FVTDX12_mainVK "Sources/mainVK.cpp")
+    add_executable(FVTDX12_mainVK "Sources/mainVK.cpp" "Resources/Shaders/HLSL/CommonStructs.h")
 
     target_compile_features(FVTDX12_mainVK PRIVATE c_std_11 cxx_std_20)
     target_compile_options(FVTDX12_mainVK PRIVATE /W4 /WX)
@@ -112,6 +112,7 @@ add_subdirectory(ThirdParty/stb)
 add_subdirectory(ThirdParty/DirectXShaderCompiler)
 
 add_subdirectory(ThirdParty/meshoptimizer)
+include_directories(ThirdParty/meshoptimizer/demo)
 
 ## SA libraries
 add_subdirectory(ThirdParty/SA/Logger)

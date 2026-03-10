@@ -1,4 +1,5 @@
 #include <array>
+#define NOMINMAX
 
 /**
 * Sapphire Suite Debugger:
@@ -337,6 +338,7 @@ MComPtr<ID3DBlob> CompileShader(std::wstring _path, std::wstring _entry, std::ws
 
 	cArgs.push_back(DXC_ARG_DEBUG);
 	cArgs.push_back(DXC_ARG_SKIP_OPTIMIZATIONS);
+	cArgs.push_back(L"-Qembed_debug");
 
 #else
 
@@ -392,6 +394,11 @@ MComPtr<ID3D12PipelineState> litPipelineState; // VkPipeline -> ID3D12PipelineSt
 MComPtr<ID3D12RootSignature> meshletRootSig;
 MComPtr<ID3D12PipelineState> meshletPipelineState;
 
+MComPtr<ID3D12RootSignature> meshletLodDebugRootSig;
+MComPtr<ID3D12PipelineState> meshletLodDebugPipelineState;
+MComPtr<ID3D12PipelineState> meshletLodDebugBoundsPipelineState;
+bool useMeshletLodDebugBounds = false;
+
 
 // === Scene Objects === /* 0009 */
 
@@ -433,8 +440,8 @@ struct ObjectUBO
 constexpr SA::Vec3f spherePosition(-2.0f, 0.0f, 2.0f);
 MComPtr<ID3D12Resource> sphereObjectBuffer;
 MComPtr<ID3D12Resource> otherObjectBuffer;
-constexpr uint32_t objectCount = 10 * 10;
-constexpr uint32_t objectCountSqrt = 10;
+constexpr uint32_t objectCount = 1;
+constexpr uint32_t objectCountSqrt = 1;
 
 // = PointLights Buffer =
 struct PointLightUBO
@@ -457,6 +464,8 @@ MComPtr<ID3D12Resource> pointLightBuffer;
 #include <assimp/scene.h>
 #include <assimp/postprocess.h>
 #include <meshoptimizer.h>
+#define CLUSTERLOD_IMPLEMENTATION
+#include <clusterlod.h>
 
 struct MeshletData
 {
@@ -726,6 +735,20 @@ void GenerateMipMapsCPU(SA::Vec2ui _extent, std::vector<char>& _data, uint32_t& 
 		}
 	}
 }
+
+struct Mesh
+{
+    std::array<MComPtr<ID3D12Resource>, 4>	VertexBuffers{}; // VkBuffer -> ID3D12Resource
+    MComPtr<ID3D12Resource>					MeshletBuffer{};
+    MComPtr<ID3D12Resource>					MeshletVertexIndexBuffer{};
+    MComPtr<ID3D12Resource>					MeshletTriangleIndexBuffer{};
+
+    std::array<D3D12_VERTEX_BUFFER_VIEW, 4>	VertexBufferViews{};
+    uint32_t								IndexCount{};
+    size_t									NumMeshlets{};
+    MComPtr<ID3D12Resource>					IndexBuffer{};
+    D3D12_INDEX_BUFFER_VIEW					IndexBufferView{};
+};
 
 uint32_t ImportMesh(
 	std::string_view							path,
@@ -1144,19 +1167,343 @@ uint32_t ImportMesh(
 #pragma endregion
 }
 
-struct Mesh
-{
-	std::array<MComPtr<ID3D12Resource>, 4>	VertexBuffers{}; // VkBuffer -> ID3D12Resource
-	MComPtr<ID3D12Resource>					MeshletBuffer{};
-	MComPtr<ID3D12Resource>					MeshletVertexIndexBuffer{};
-	MComPtr<ID3D12Resource>					MeshletTriangleIndexBuffer{};
+#pragma region Mesh LOD structs
 
-	std::array<D3D12_VERTEX_BUFFER_VIEW, 4>	VertexBufferViews{};
-	uint32_t								IndexCount{};
-	size_t									NumMeshlets{};
-	MComPtr<ID3D12Resource>					IndexBuffer{};
-	D3D12_INDEX_BUFFER_VIEW					IndexBufferView{};
+struct Cluster
+{
+	SA::Vec3f    center{};
+	float        radius{};
+	float        error{};
+
+	uint32_t vertexStart{};
+	uint32_t vertexCount{};
+	uint32_t triangleStart{};
+	uint32_t triangleCount{};
+
+	uint32_t groupIndex{};
+	int32_t  refinedGroup{};
+	uint32_t padding{};
 };
+
+struct Group
+{
+	SA::Vec3f    center{};
+	float        radius{};
+	float        error{};
+
+	uint32_t clusterStart{};
+	uint32_t clusterCount{};
+
+	int32_t  depth{};
+	uint32_t levelIndex{};
+	float    padding[3]{};
+};
+
+struct Level
+{
+	uint32_t groupBegin{};       // into global group array
+	uint32_t groupCount{};
+
+	int32_t  depth{};            // original clodGroup.depth
+	uint32_t padding{};
+};
+
+struct MeshLODCPU
+{
+	std::vector<Cluster>  clusters;
+	std::vector<Group>    groups;
+	std::vector<Level>    levels;
+
+	std::vector<uint32_t> clusterVertices;
+	std::vector<uint32_t>  clusterTriangles;
+};
+
+#pragma endregion
+
+struct MeshLOD
+{
+	MComPtr<ID3D12Resource>					positionBuffer;
+    MComPtr<ID3D12Resource>					meshletBuffer{};
+    MComPtr<ID3D12Resource>					meshletVertexIndexBuffer{};
+    MComPtr<ID3D12Resource>					meshletTriangleIndexBuffer{};
+
+	MeshLODCPU								meshCPU;
+};
+
+void BuildLevels(MeshLODCPU& mesh)
+{
+	std::vector<uint32_t> groupOrder(mesh.groups.size());
+	for (uint32_t i = 0; i < groupOrder.size(); ++i)
+		groupOrder[i] = i;
+
+	std::stable_sort(groupOrder.begin(), groupOrder.end(),
+					 [&](uint32_t a, uint32_t b)
+					 {
+						 return mesh.groups[a].depth < mesh.groups[b].depth;
+					 });
+
+	std::vector<Group> newGroups;
+	std::vector<Cluster> newClusters;
+	newGroups.reserve(mesh.groups.size());
+	newClusters.reserve(mesh.clusters.size());
+	std::vector<uint32_t> groupIndexRemap;
+	groupIndexRemap.resize(mesh.groups.size());
+
+	mesh.levels.clear();
+	int32_t currentDepth = std::numeric_limits<int32_t>::min();
+
+	for (uint32_t oldGrpIdx : groupOrder)
+	{
+		Group& oldGrp = mesh.groups[oldGrpIdx];
+		if (mesh.levels.empty() || oldGrp.depth != currentDepth)
+		{
+			currentDepth = oldGrp.depth;
+
+			Level level{};
+			level.depth = currentDepth;
+			level.groupBegin = (uint32_t)newGroups.size();
+			level.groupCount = 0;
+			mesh.levels.push_back(level);
+		}
+		Group newGrp = oldGrp;
+		newGrp.levelIndex = (uint32_t)mesh.levels.size() - 1;
+		newGrp.clusterStart = (uint32_t)newClusters.size();
+		newGroups.push_back(newGrp);
+		groupIndexRemap[oldGrpIdx] = (uint32_t)newGroups.size() - 1;
+
+		for (uint32_t i = 0; i < oldGrp.clusterCount; ++i)
+		{
+			Cluster cluster = mesh.clusters[oldGrp.clusterStart + i];
+			cluster.groupIndex = (uint32_t)newGroups.size() - 1;
+			newClusters.push_back(cluster);
+		}
+
+		mesh.levels.back().groupCount++;
+	}
+	for (Cluster& cluster : newClusters)
+	{
+		if (cluster.refinedGroup >= 0)
+			cluster.refinedGroup = groupIndexRemap[cluster.refinedGroup];
+	}
+
+	mesh.groups = std::move(newGroups);
+	mesh.clusters = std::move(newClusters);
+}
+
+uint32_t ImportMeshLod(
+	std::string_view							path,
+	const std::wstring&							meshName,
+	MeshLOD&									mesh
+)
+{
+	Assimp::Importer importer;
+	const aiScene* scene = importer.ReadFile(path.data(), aiProcess_CalcTangentSpace | aiProcess_ConvertToLeftHanded);
+	if (!scene)
+	{
+		SA_LOG(L"Assimp loading failed!", Error, Assimp, path);
+		return EXIT_FAILURE;
+	}
+
+	const aiMesh* inMesh = scene->mMeshes[0];
+	std::wstring name = meshName + L"MeshletBuffer";
+
+	clodConfig config = clodDefaultConfig(128);
+	config.cluster_fill_weight = 0.5f;
+	config.cluster_split_factor = 2.0f;
+	config.partition_size = 32;
+	config.partition_spatial = true;
+	config.partition_sort = true;
+
+	while ((config.partition_size + config.partition_size / 3) > 32)
+	{
+		config.partition_size--;
+	}
+
+	config.simplify_error_merge_previous = 1.5f;
+	config.simplify_error_merge_additive = 0.0f;
+	config.simplify_error_edge_limit = 0.0f;
+
+	clodMesh inputMesh = {};
+	inputMesh.vertex_positions = reinterpret_cast<const float*>(inMesh->mVertices);
+	inputMesh.vertex_count = inMesh->mNumVertices;
+	inputMesh.vertex_positions_stride = sizeof(aiVector3D);
+	
+	inputMesh.index_count = inMesh->mNumFaces * 3;
+	std::vector<uint32_t> indices;
+	indices.resize(inputMesh.index_count);
+	for (unsigned int i = 0; i < inMesh->mNumFaces; ++i)
+	{
+		indices[i * 3] = static_cast<uint32_t>(inMesh->mFaces[i].mIndices[0]);
+		indices[i * 3 + 1] = static_cast<uint32_t>(inMesh->mFaces[i].mIndices[1]);
+		indices[i * 3 + 2] = static_cast<uint32_t>(inMesh->mFaces[i].mIndices[2]);
+	}
+	inputMesh.indices = reinterpret_cast<const uint32_t*>(indices.data());
+
+	float attributeWeights[3]{};
+	if (inMesh->HasNormals())
+	{
+		attributeWeights[0] = 0.5f;
+		attributeWeights[1] = 0.5f;
+		attributeWeights[2] = 0.5f;
+	}
+
+	inputMesh.attribute_count			= inMesh->HasNormals() ? 3 : 0;
+	inputMesh.attribute_weights			= attributeWeights;
+	inputMesh.vertex_attributes			= inMesh->HasNormals() ? reinterpret_cast<const float*>(inMesh->mNormals) : nullptr;
+	inputMesh.vertex_attributes_stride	= inMesh->HasNormals() ? sizeof(aiVector3D) : 0;
+
+	MeshLODCPU meshLod{};
+
+	clodBuild(
+		config, inputMesh,
+		[&](clodGroup group, const clodCluster* clusters, size_t clusterCount) -> int
+		{
+			uint32_t groupIndex = (uint32_t)meshLod.groups.size();
+			uint32_t startOfCluster = (uint32_t)meshLod.clusters.size();
+
+			Group newGroup{};
+			newGroup.center       = SA::Vec3f{ group.simplified.center[0], group.simplified.center[1], group.simplified.center[2] };
+			newGroup.radius       = group.simplified.radius;
+			newGroup.error        = group.simplified.error;
+			newGroup.depth        = group.depth;
+			newGroup.clusterStart = startOfCluster;
+			newGroup.clusterCount = (uint32_t)clusterCount;
+
+			meshLod.groups.emplace_back(newGroup);
+			for (size_t i = 0; i < clusterCount; ++i)
+			{
+				const clodCluster& inCluster = clusters[i];
+
+				Cluster cluster{};
+				cluster.groupIndex   = groupIndex;
+				cluster.refinedGroup = inCluster.refined;
+
+				cluster.center = SA::Vec3f{ inCluster.bounds.center[0], inCluster.bounds.center[1], inCluster.bounds.center[2] };
+				cluster.radius = inCluster.bounds.radius;
+				cluster.error  = inCluster.bounds.error;
+
+				cluster.vertexStart   = (uint32_t)meshLod.clusterVertices.size();
+				cluster.triangleStart = (uint32_t)meshLod.clusterTriangles.size();
+
+				std::vector<uint32_t> localVertices(inCluster.vertex_count);
+				std::vector<uint8_t>  localTriangles(inCluster.index_count);
+
+				size_t uniqueVertexCount = clodLocalIndices(
+					localVertices.data(),
+					localTriangles.data(),
+					inCluster.indices,
+					inCluster.index_count);
+
+				cluster.vertexCount = static_cast<uint32_t>(uniqueVertexCount);
+				cluster.triangleCount = static_cast<uint32_t>(inCluster.index_count / 3);
+
+				meshLod.clusterVertices.insert(
+					meshLod.clusterVertices.end(),
+					localVertices.begin(),
+					localVertices.begin() + uniqueVertexCount);
+
+				meshLod.clusterTriangles.insert(
+					meshLod.clusterTriangles.end(),
+					localTriangles.begin(),
+					localTriangles.begin() + inCluster.index_count);
+
+				meshLod.clusters.push_back(cluster);
+			}
+			return groupIndex;
+		}
+	);
+
+	BuildLevels(meshLod);
+
+#pragma region upload meshlet data
+
+    const D3D12_HEAP_PROPERTIES heap{
+            .Type = D3D12_HEAP_TYPE_DEFAULT,
+    };
+    CD3DX12_RESOURCE_DESC desc = CD3DX12_RESOURCE_DESC::Buffer(meshLod.clusters.size() * sizeof(Cluster));
+    HRESULT hr = device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&mesh.meshletBuffer));
+    if (FAILED(hr))
+    {
+        SA_LOG(L"Create Meshlet Buffer failed!", Error, DX12, (L"Error code: %1", hr));
+        return EXIT_FAILURE;
+    }
+    bool bSubmitSuccess = SubmitBufferToGPU(mesh.meshletBuffer, desc.Width, meshLod.clusters.data(), D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
+    if (!bSubmitSuccess)
+    {
+        SA_LOG(L"Meshlet Buffer submit failed!", Error, DX12);
+        return EXIT_FAILURE;
+    }
+    mesh.meshletBuffer->SetName(name.c_str());
+
+    desc = CD3DX12_RESOURCE_DESC::Buffer(meshLod.clusterVertices.size() * sizeof(uint32_t));
+    hr = device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&mesh.meshletVertexIndexBuffer));
+    if (FAILED(hr))
+    {
+        SA_LOG(L"Create Meshlet Vertex Index Buffer failed!", Error, DX12, (L"Error code: %1", hr));
+        return EXIT_FAILURE;
+    }
+    bSubmitSuccess = SubmitBufferToGPU(mesh.meshletVertexIndexBuffer, desc.Width, meshLod.clusterVertices.data(), D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
+    if (!bSubmitSuccess)
+    {
+        SA_LOG(L"Meshlet Vertex Index Buffer submit failed!", Error, DX12);
+        return EXIT_FAILURE;
+    }
+    name = meshName + L"MeshletVertexIndexBuffer";
+    mesh.meshletVertexIndexBuffer->SetName(name.c_str());
+
+    desc = CD3DX12_RESOURCE_DESC::Buffer(meshLod.clusterTriangles.size() * sizeof(uint32_t)); // packed in 32-bit
+    hr = device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&mesh.meshletTriangleIndexBuffer));
+    if (FAILED(hr))
+    {
+        SA_LOG(L"Create Meshlet Triangle Index Buffer failed!", Error, DX12, (L"Error code: %1", hr));
+        return EXIT_FAILURE;
+    }
+    bSubmitSuccess = SubmitBufferToGPU(mesh.meshletTriangleIndexBuffer, desc.Width, meshLod.clusterTriangles.data(), D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
+    if (!bSubmitSuccess)
+    {
+        SA_LOG(L"Meshlet Triangle Index Buffer submit failed!", Error, DX12);
+        return EXIT_FAILURE;
+    }
+    name = meshName + L"MeshletTriangleIndexBuffer";
+    mesh.meshletTriangleIndexBuffer->SetName(name.c_str());
+
+#pragma endregion
+
+#pragma region Position
+	D3D12_RESOURCE_DESC posDesc{
+		.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER,
+		.Alignment = 0,
+		.Width = sizeof(SA::Vec3f) * inMesh->mNumVertices,
+		.Height = 1,
+		.DepthOrArraySize = 1,
+		.MipLevels = 1,
+		.Format = DXGI_FORMAT_UNKNOWN,
+		.SampleDesc = {.Count = 1, .Quality = 0 },
+		.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+		.Flags = D3D12_RESOURCE_FLAG_NONE,
+	};
+
+	const HRESULT hrBufferCreated = device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &posDesc, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&mesh.positionBuffer));
+	if (FAILED(hrBufferCreated))
+	{
+		SA_LOG(L"Create Vertex Position Buffer failed!", Error, DX12, (L"Error code: %1", hrBufferCreated));
+		return EXIT_FAILURE;
+	}
+	name = meshName + L"VertexPositionBuffer";
+	mesh.positionBuffer->SetName(name.c_str());
+
+	SA_LOG(L"Create Vertex Position Buffer success.", Info, DX12, (L"\"%1\" [%2]", name, mesh.positionBuffer.Get()));
+
+	bSubmitSuccess = SubmitBufferToGPU(mesh.positionBuffer, posDesc.Width, inMesh->mVertices, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
+	if (!bSubmitSuccess)
+	{
+		SA_LOG(L"Vertex Position Buffer submit failed!", Error, DX12);
+		return EXIT_FAILURE;
+	}
+#pragma endregion
+    mesh.meshCPU = std::move(meshLod);
+	return 0;
+}
 
 void DestroyMesh(Mesh& mesh)
 {
@@ -1184,8 +1531,12 @@ void DestroyMesh(Mesh& mesh)
 }
 
 // = Sphere =
-Mesh sphereMesh{};
-Mesh dragonMesh{};
+Mesh		sphereMesh{};
+Mesh		dragonMesh{};
+MeshLOD		bunnyLodMesh{};
+
+constexpr bool renderDragonMesh = false;
+constexpr bool renderBunnyLodMeshDebug = true;
 
 // = RustedIron2 PBR =
 MComPtr<ID3D12Resource> rustedIron2AlbedoTexture; // VkImage + VkDeviceMemory -> ID3D12Resource
@@ -1195,7 +1546,7 @@ MComPtr<ID3D12Resource> rustedIron2RoughnessTexture;
 
 int main()
 {
-	// Initialization
+	#pragma region Initialization
 	if (true)
 	{
 		SA::Debug::InitDefaultLogger();
@@ -1220,7 +1571,7 @@ int main()
 
 			glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
 		}
-
+    #pragma endregion
 
 		// Renderer
 		{
@@ -1332,9 +1683,9 @@ int main()
 						infoQueue->RegisterMessageCallback(ValidationLayersDebugCallback,
 							D3D12_MESSAGE_CALLBACK_IGNORE_FILTERS, nullptr, &VLayerCallbackCookie);
 
-						infoQueue->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_CORRUPTION, true);
-						infoQueue->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_ERROR, true);
-						infoQueue->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_WARNING, true);
+                        //infoQueue->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_CORRUPTION, true);
+                        //infoQueue->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_ERROR, true);
+                        //infoQueue->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_WARNING, true);
 					}
 					else
 					{
@@ -1656,7 +2007,7 @@ int main()
 			// Pipeline /* 0008-I */
 			if (true)
 			{
-				// Viewport & Scissor
+			#pragma region Viewport & Scissor
 				{
 					viewport = D3D12_VIEWPORT{
 						.TopLeftX = 0,
@@ -1674,8 +2025,9 @@ int main()
 						.bottom = static_cast<LONG>(windowSize.y),
 					};
 				}
+            #pragma endregion
 
-				// Shader Compiler
+			#pragma region Shader Compiler
 				{
 					const HRESULT hCreateUtils = DxcCreateInstance(CLSID_DxcUtils, IID_PPV_ARGS(&shaderCompilerUtils));
 					if (FAILED(hCreateUtils))
@@ -1697,8 +2049,9 @@ int main()
 						return EXIT_FAILURE;
 					}
 				}
+            #pragma endregion
 
-				// Lit
+			#pragma region Lit
 				{
 				#pragma region RootSignature /* 0008-1-I */
 					// RootSignature /* 0008-1-I */
@@ -2055,6 +2408,7 @@ int main()
 					}
 				#pragma endregion // PipelineState
 				}
+			#pragma endregion
 
 			#pragma region Meshlet
 				{
@@ -2115,6 +2469,125 @@ int main()
 					}
 					SA_LOG(L"Create Meshlet Pipeline State success.", Info, DX12, meshletPipelineState.Get());
 					meshletPipelineState->SetName(L"MeshletPipelineState");
+				}
+			#pragma endregion
+
+			#pragma region Meshlet Lod Debug
+				{
+					MComPtr<ID3DBlob> meshletLodDebugAmp = CompileShader(L"Resources/Shaders/HLSL/LodMeshletShaderDebug.hlsl", L"mainAS", L"as_6_5");
+                    if (!meshletLodDebugAmp)
+                        return EXIT_FAILURE;
+                    MComPtr<ID3DBlob> meshletLodDebugMesh = CompileShader(L"Resources/Shaders/HLSL/LodMeshletShaderDebug.hlsl", L"mainMS", L"ms_6_5");
+                    if (!meshletLodDebugMesh)
+                        return EXIT_FAILURE;
+                    MComPtr<ID3DBlob> meshletLodDebugPixel = CompileShader(L"Resources/Shaders/HLSL/LodMeshletShaderDebug.hlsl", L"mainPS", L"ps_6_5");
+                    if (!meshletLodDebugPixel)
+                        return EXIT_FAILURE;
+
+                    HRESULT hres = device->CreateRootSignature(0, meshletLodDebugAmp->GetBufferPointer(), meshletLodDebugAmp->GetBufferSize(), IID_PPV_ARGS(&meshletLodDebugRootSig));
+                    if (FAILED(hres))
+                    {
+                        SA_LOG(L"Create Meshlet Lod Root Signature failed!", Error, DX12, (L"Error Code: %1", hres));
+                        return EXIT_FAILURE;
+                    }
+                    SA_LOG(L"Create Meshlet Lod Root Signature success.", Info, DX12, meshletLodDebugRootSig.Get());
+					meshletLodDebugRootSig->SetName(L"MeshletLodRootSig");
+
+					D3DX12_MESH_SHADER_PIPELINE_STATE_DESC meshletLodDebugPSODesc = {};
+					meshletLodDebugPSODesc.pRootSignature = meshletLodDebugRootSig.Get();
+					meshletLodDebugPSODesc.AS = {
+						.pShaderBytecode = meshletLodDebugAmp->GetBufferPointer(),
+						.BytecodeLength = meshletLodDebugAmp->GetBufferSize()
+					};
+					meshletLodDebugPSODesc.MS = {
+						.pShaderBytecode = meshletLodDebugMesh->GetBufferPointer(),
+						.BytecodeLength = meshletLodDebugMesh->GetBufferSize()
+					};
+					meshletLodDebugPSODesc.PS = {
+						.pShaderBytecode = meshletLodDebugPixel->GetBufferPointer(),
+						.BytecodeLength = meshletLodDebugPixel->GetBufferSize()
+					};
+					meshletLodDebugPSODesc.RTVFormats[0] = sceneColorFormat;
+                    D3D12_FEATURE_DATA_FORMAT_SUPPORT formatSupport = {};
+                    formatSupport.Format = sceneColorFormat;
+                    HRESULT hr = device->CheckFeatureSupport(
+                        D3D12_FEATURE_FORMAT_SUPPORT,
+                        &formatSupport,
+                        sizeof(formatSupport));
+
+                    if (SUCCEEDED(hr))
+                    {
+                        bool blendable = (formatSupport.Support1 & D3D12_FORMAT_SUPPORT1_BLENDABLE) != 0;
+                        SA_LOG(L"Scene Color Format " + std::to_wstring(sceneColorFormat) + L" support blendable: " + (blendable ? L"Yes" : L"No"), Info, DX12);
+                    }
+					meshletLodDebugPSODesc.NumRenderTargets = 1;
+					meshletLodDebugPSODesc.DSVFormat = sceneDepthFormat;
+					meshletLodDebugPSODesc.RasterizerState = CD3DX12_RASTERIZER_DESC(D3D12_DEFAULT);
+					meshletLodDebugPSODesc.RasterizerState.FrontCounterClockwise = FALSE;
+					meshletLodDebugPSODesc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+					meshletLodDebugPSODesc.BlendState = CD3DX12_BLEND_DESC(D3D12_DEFAULT);
+					meshletLodDebugPSODesc.DepthStencilState = CD3DX12_DEPTH_STENCIL_DESC(D3D12_DEFAULT);
+					meshletLodDebugPSODesc.SampleMask = UINT_MAX;
+					meshletLodDebugPSODesc.SampleDesc = DefaultSampleDesc();
+					auto psoStream = CD3DX12_PIPELINE_MESH_STATE_STREAM(meshletLodDebugPSODesc);
+
+					D3D12_PIPELINE_STATE_STREAM_DESC streamDesc = {
+						.SizeInBytes = sizeof(psoStream),
+						.pPipelineStateSubobjectStream = &psoStream
+					};
+                    hres = device->CreatePipelineState(&streamDesc, IID_PPV_ARGS(&meshletLodDebugPipelineState));
+                    if (FAILED(hres))
+                    {
+                        SA_LOG(L"Create Meshlet Lod Pipeline State failed!", Error, DX12, (L"Error Code: %1", hres));
+                        return EXIT_FAILURE;
+                    }
+                    SA_LOG(L"Create Meshlet Lod Pipeline State success.", Info, DX12, meshletLodDebugPipelineState.Get());
+                    meshletLodDebugPipelineState->SetName(L"MeshletLodPipelineState");
+
+					meshletLodDebugMesh = CompileShader(L"Resources/Shaders/HLSL/LodMeshletShaderDebug.hlsl", L"mainMS", L"ms_6_5", { L"DEBUG_CLUSTER_BOUNDS" });
+					if (meshletLodDebugMesh == nullptr)
+                        return EXIT_FAILURE;
+                    meshletLodDebugPixel = CompileShader(L"Resources/Shaders/HLSL/LodMeshletShaderDebug.hlsl", L"mainPS", L"ps_6_5", { L"DEBUG_CLUSTER_BOUNDS" });
+					if (meshletLodDebugPixel == nullptr)
+                        return EXIT_FAILURE;
+
+					meshletLodDebugPSODesc.MS = {
+						.pShaderBytecode = meshletLodDebugMesh->GetBufferPointer(),
+						.BytecodeLength = meshletLodDebugMesh->GetBufferSize()
+                    };
+					meshletLodDebugPSODesc.PS = {
+						.pShaderBytecode = meshletLodDebugPixel->GetBufferPointer(),
+						.BytecodeLength = meshletLodDebugPixel->GetBufferSize()
+					};
+                    D3D12_RENDER_TARGET_BLEND_DESC debugBlend{
+                        .BlendEnable = TRUE,
+                        .LogicOpEnable = FALSE,
+                        .SrcBlend = D3D12_BLEND_SRC_ALPHA,
+                        .DestBlend = D3D12_BLEND_INV_SRC_ALPHA,
+                        .BlendOp = D3D12_BLEND_OP_ADD,
+                        .SrcBlendAlpha = D3D12_BLEND_ONE,
+                        .DestBlendAlpha = D3D12_BLEND_ZERO,
+                        .BlendOpAlpha = D3D12_BLEND_OP_ADD,
+                        .LogicOp = D3D12_LOGIC_OP_NOOP,
+                        .RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL,
+                    };
+                    meshletLodDebugPSODesc.BlendState.RenderTarget[0] = debugBlend;
+                    D3D12_DEPTH_STENCIL_DESC ds = CD3DX12_DEPTH_STENCIL_DESC(D3D12_DEFAULT);
+                    ds.DepthEnable = TRUE;
+                    ds.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+                    ds.DepthFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
+                    meshletLodDebugPSODesc.DepthStencilState = ds;
+                    psoStream = CD3DX12_PIPELINE_MESH_STATE_STREAM(meshletLodDebugPSODesc);
+                    streamDesc = {
+                        .SizeInBytes = sizeof(psoStream),
+                        .pPipelineStateSubobjectStream = &psoStream
+                    };
+                    hres = device->CreatePipelineState(&streamDesc, IID_PPV_ARGS(&meshletLodDebugBoundsPipelineState));
+					if (FAILED(hres))
+					{
+						SA_LOG(L"Create Meshlet Lod Debug Bounds Pipeline State failed!", Error, DX12, (L"Error Code: %1", hres));
+						return EXIT_FAILURE;
+                    }
 				}
 			#pragma endregion
 			}
@@ -2251,7 +2724,8 @@ int main()
 					{
 						for (int z = 0; z < objectCountSqrt; ++z)
 						{
-							const SA::Vec3f pos = SA::Vec3f(-25.f + x * 5.0f, 0.0f, 10.f + z * 5.f);
+							//const SA::Vec3f pos = SA::Vec3f(-25.f + x * 5.0f, 0.0f, 10.f + z * 5.f);
+							const SA::Vec3f pos = SA::Vec3f(0.0f, 0.0f, 30.f);
 							transforms[x * objectCountSqrt + z] = SA::Mat4f::MakeTranslation(pos);
 						}
 					}
@@ -2363,20 +2837,35 @@ int main()
 // 							SA_LOG((L"Import Mesh {%1} failed!", path), Error, Assimp, (L"Error code: %1", r));
 // 							return EXIT_FAILURE;
 // 						}
-						path = "Resources/Models/Dragon.obj";
-						uint32_t r = ImportMesh(
-							path, L"Dragon", 
-							dragonMesh.MeshletBuffer, dragonMesh.MeshletVertexIndexBuffer,
-							dragonMesh.MeshletTriangleIndexBuffer,
-							dragonMesh.VertexBuffers, dragonMesh.VertexBufferViews,
-							dragonMesh.IndexBuffer, dragonMesh.IndexBufferView,
-							dragonMesh.IndexCount, dragonMesh.NumMeshlets
-						);
-
-						if (r == EXIT_FAILURE)
+						uint32_t r;
+						if constexpr (renderDragonMesh)
 						{
-							SA_LOG((L"Import Mesh {%1} failed!", path), Error, Assimp, (L"Error code: %1", r));
-							return EXIT_FAILURE;
+							path = "Resources/Models/Dragon.obj";
+							r = ImportMesh(
+								path, L"Dragon", 
+								dragonMesh.MeshletBuffer, dragonMesh.MeshletVertexIndexBuffer,
+								dragonMesh.MeshletTriangleIndexBuffer,
+								dragonMesh.VertexBuffers, dragonMesh.VertexBufferViews,
+								dragonMesh.IndexBuffer, dragonMesh.IndexBufferView,
+								dragonMesh.IndexCount, dragonMesh.NumMeshlets
+                            );
+
+                            if (r == EXIT_FAILURE)
+                            {
+                                SA_LOG((L"Import Mesh {%1} failed!", path), Error, Assimp, (L"Error code: %1", r));
+                                return EXIT_FAILURE;
+                            }
+						}
+
+						if constexpr (renderBunnyLodMeshDebug)
+						{
+							path = "Resources/Models/Bunny.obj";
+							r = ImportMeshLod(path, L"Bunny", bunnyLodMesh);
+							if (r == EXIT_FAILURE)
+							{
+								SA_LOG((L"Import LOD Mesh {%1} failed!", path), Error, Assimp, (L"Error code: %1", r));
+								return EXIT_FAILURE;
+                            }
 						}
 					}
 				}
@@ -2767,6 +3256,7 @@ int main()
 			accumulateTime += deltaTime;
 			start = end;
 
+        #pragma region Input & Camera Update
 			// Fixed Update
 			if (accumulateTime >= fixedTime)
 			{
@@ -2824,6 +3314,7 @@ int main()
 					}
 				}
 			}
+		#pragma endregion
 
 
 			// Render
@@ -3043,6 +3534,7 @@ int main()
 					}
 
 					// Meshlet Pipeline
+					if constexpr (renderDragonMesh)
 					{
 						cmd->SetGraphicsRootSignature(meshletRootSig.Get());
 						cmd->SetGraphicsRootConstantBufferView(0, cameraBuffer->GetGPUVirtualAddress());
@@ -3067,6 +3559,41 @@ int main()
 						cmd->SetPipelineState(meshletPipelineState.Get());
 						cmd->DispatchMesh(((uint32_t)dragonMesh.NumMeshlets * (uint32_t)objectCount + 31) / 32, 1, 1);
 					}
+
+					if constexpr (renderBunnyLodMeshDebug)
+                    {
+                        auto& levelHigh = bunnyLodMesh.meshCPU.levels[0];
+                        uint32_t numClusters = 0;
+                        uint32_t clustersStart = bunnyLodMesh.meshCPU.groups[levelHigh.groupBegin].clusterStart;
+                        for (uint32_t i = levelHigh.groupBegin; i < levelHigh.groupBegin + levelHigh.groupCount; ++i)
+                        {
+                            const Group& group = bunnyLodMesh.meshCPU.groups[i];
+                            numClusters += group.clusterCount;
+                            if (group.clusterStart < clustersStart)
+								clustersStart = group.clusterStart;
+                        }
+
+                        cmd->SetGraphicsRootSignature(meshletLodDebugRootSig.Get());
+                        cmd->SetGraphicsRootConstantBufferView(0, cameraBuffer->GetGPUVirtualAddress());
+
+                        cmd->SetGraphicsRoot32BitConstant(1, (uint32_t)clustersStart, 0);
+                        cmd->SetGraphicsRoot32BitConstant(1, (uint32_t)numClusters, 1);
+                        cmd->SetGraphicsRoot32BitConstant(1, (uint32_t)objectCount, 2);
+                        cmd->SetGraphicsRootShaderResourceView(2, otherObjectBuffer->GetGPUVirtualAddress());
+
+                        cmd->SetGraphicsRootShaderResourceView(3, bunnyLodMesh.positionBuffer->GetGPUVirtualAddress());
+
+                        cmd->SetGraphicsRootShaderResourceView(7, bunnyLodMesh.meshletBuffer->GetGPUVirtualAddress());
+                        cmd->SetGraphicsRootShaderResourceView(8, bunnyLodMesh.meshletVertexIndexBuffer->GetGPUVirtualAddress());
+                        cmd->SetGraphicsRootShaderResourceView(9, bunnyLodMesh.meshletTriangleIndexBuffer->GetGPUVirtualAddress());
+                        cmd->SetPipelineState(meshletLodDebugPipelineState.Get());
+                        cmd->DispatchMesh(((uint32_t)(numClusters) * (uint32_t)objectCount + 31) / 32, 1, 1);
+						if (useMeshletLodDebugBounds)
+						{
+							cmd->SetPipelineState(meshletLodDebugBoundsPipelineState.Get());
+							cmd->DispatchMesh(((uint32_t)(numClusters) * (uint32_t)objectCount + 31) / 32, 1, 1);
+						}
+                    }
 
 					// Manage RenderTargets for present. 0006-U2
 					{
