@@ -3705,9 +3705,12 @@ int main()
 
 						cmd->SetGraphicsRootShaderResourceView(3, bunnyLodMesh.positionBuffer->GetGPUVirtualAddress());
 
-						cmd->SetGraphicsRootShaderResourceView(7, bunnyLodMesh.clusterBuffer->GetGPUVirtualAddress());
-						cmd->SetGraphicsRootShaderResourceView(8, bunnyLodMesh.meshletVertexIndexBuffer->GetGPUVirtualAddress());
-						cmd->SetGraphicsRootShaderResourceView(9, bunnyLodMesh.meshletTriangleIndexBuffer->GetGPUVirtualAddress());
+						cmd->SetGraphicsRootShaderResourceView(4, bunnyLodMesh.meshletVertexIndexBuffer->GetGPUVirtualAddress());
+						cmd->SetGraphicsRootShaderResourceView(5, bunnyLodMesh.meshletTriangleIndexBuffer->GetGPUVirtualAddress());
+						cmd->SetGraphicsRootShaderResourceView(6, bunnyLodMesh.clusterBuffer->GetGPUVirtualAddress());
+						cmd->SetGraphicsRootShaderResourceView(7, bunnyLodMesh.groupBuffer->GetGPUVirtualAddress());
+						cmd->SetGraphicsRootShaderResourceView(8, bunnyLodMesh.nodeBuffer->GetGPUVirtualAddress());
+
 						cmd->SetPipelineState(meshletLodDebugPipelineState.Get());
 						cmd->DispatchMesh(((uint32_t)(numClusters) * (uint32_t)objectCount + 31) / 32, 1, 1);
 						if (useMeshletLodDebugBounds)

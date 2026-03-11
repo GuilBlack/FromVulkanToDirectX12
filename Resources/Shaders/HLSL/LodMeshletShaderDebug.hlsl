@@ -1,6 +1,5 @@
 #define ROOT_SIG "CBV(b0), \
                   RootConstants(b1, num32bitconstants=3), \
-                  SRV(t7), \
                   SRV(t0), \
                   SRV(t1), \
                   SRV(t2), \
@@ -10,6 +9,7 @@
                   SRV(t6)"
 
 #include "CommonStructs.h"
+#include "CommonCluster.h"
 
 struct PushConstants
 {
@@ -28,34 +28,18 @@ struct VertexOutput
     float2 uv : TEXCOORD0;
 };
 
-struct Cluster
-{
-	float3       Center;
-	float        Radius;
-	float        Error;
-
-	uint32_t     VertexStart;
-	uint32_t     VertexCount;
-	uint32_t     TriangleStart;
-	uint32_t     TriangleCount;
-
-	uint32_t     GroupIndex;
-	int32_t      RefinedGroup;
-	uint32_t     Padding;
-};
-
 ConstantBuffer<Scene>          sceneBuffer : register(b0);
 ConstantBuffer<PushConstants>   pushConstants : register(b1);
-StructuredBuffer<Object>        objectBuffer : register(t7);
+StructuredBuffer<Object>        objectBuffer : register(t0);
 
-StructuredBuffer<float3>        vertices : register(t0);
-StructuredBuffer<float3>        normals : register(t1);
-StructuredBuffer<float3>        tangents : register(t2);
-StructuredBuffer<float2>        uvs : register(t3);
+StructuredBuffer<float3>        vertices : register(t1);
+
+StructuredBuffer<uint>          meshletVertexIndices : register(t2);
+StructuredBuffer<uint>          meshletTriangleIndices : register(t3);
 
 StructuredBuffer<Cluster>       meshlets : register(t4);
-StructuredBuffer<uint>          meshletVertexIndices : register(t5);
-StructuredBuffer<uint>          meshletTriangleIndices : register(t6);
+StructuredBuffer<ClusterGroup>  meshletGroups : register(t5);
+StructuredBuffer<ClusterNode>   meshletNodes : register(t6);
 
 float DistToPlane(float3 planeNormal, float3 planePoint, float3 p)
 {
@@ -65,6 +49,14 @@ float DistToPlane(float3 planeNormal, float3 planePoint, float3 p)
 bool IsMeshletVisible(Cluster c, float4x4 world)
 {
     float3 worldCenter = mul(world, float4(c.Center, 1)).xyz;
+    ClusterGroup group = meshletGroups[c.GroupIndex];
+    ClusterNode node = meshletNodes[0];
+
+    for (uint i = 0; i < group.clusterCount; ++i)
+    {
+        if (node.isLeaf != 0)
+            break;
+    }
 
     bool isInFrustum = true;
     for (int i = 0; i < 6; ++i)
