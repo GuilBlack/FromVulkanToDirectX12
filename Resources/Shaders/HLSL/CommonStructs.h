@@ -21,6 +21,15 @@ struct Scene
     float3 camPosition;
     uint useOldPlanes;
     uint debugGroups;
+
+    uint maxTraversalInfo;
+    uint maxRenderClusters;
+    float nearPlane;
+    float farPlane;
+
+    float errorOverDistance;
+    uint  debugLodError;
+    uint  totalNodes;
 };
 
 struct Object

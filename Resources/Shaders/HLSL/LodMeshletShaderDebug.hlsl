@@ -28,7 +28,7 @@ struct VertexOutput
     float2 uv : TEXCOORD0;
 };
 
-ConstantBuffer<Scene>          sceneBuffer : register(b0);
+ConstantBuffer<Scene>           sceneBuffer : register(b0);
 ConstantBuffer<PushConstants>   pushConstants : register(b1);
 StructuredBuffer<Object>        objectBuffer : register(t0);
 
@@ -168,6 +168,14 @@ static const uint3 kDebugBoundTris[8] =
     uint3(5, 1, 4)
 };
 
+bool testForTraversal(float4x4 instanceToEye, float3 center, float uniformScale, float radius, float error)
+{
+    float sphereDistance = length(mul(instanceToEye, float4(center, 1.0)).xyz);
+    float errorDistance = max(sceneBuffer.nearPlane, sphereDistance - radius * uniformScale);
+    float errorOverDistance = error * uniformScale / errorDistance;
+    return errorOverDistance >= sceneBuffer.errorOverDistance;
+}
+
 [NumThreads(128, 1, 1)]
 [outputtopology("triangle")]
 void mainMS(
@@ -197,8 +205,8 @@ void mainMS(
     {
         float3 localPos = c.Center + kDebugBoundVerts[gtid.x] * c.Radius;
         float4 worldPos = mul(world, float4(localPos, 1.0));
-
-        verts[gtid.x].svPosition = mul(sceneBuffer.invViewProj, worldPos);
+        float4x4 worldToNdc = mul(sceneBuffer.invViewProj, world);
+        verts[gtid.x].svPosition = mul(worldToNdc, float4(localPos, 1.0));
         verts[gtid.x].worldPosition = worldPos.xyz;
         verts[gtid.x].color = HashColor(meshletIndex);
         verts[gtid.x].uv = float2(0.0, 0.0);
@@ -222,11 +230,16 @@ void mainMS(
     {
         uint vertexIndex = meshletVertexIndices[c.VertexStart + gtid.x];
         float4 worldPosition = mul(world, float4(vertices[vertexIndex], 1.0));
-
+        // float4x4 worldToNdc = mul(sceneBuffer.invViewProj, world);
         verts[gtid.x].svPosition = mul(sceneBuffer.invViewProj, worldPosition);
         verts[gtid.x].worldPosition = worldPosition.xyz;
+        
+        // debug error instead of color
+        ClusterGroup group = meshletGroups[c.GroupIndex];
+        bool traverse = testForTraversal(mul(sceneBuffer.view, world), group.center, 1.0, group.radius, group.error);
         uint colorId = sceneBuffer.debugGroups ? c.GroupIndex : meshletIndex;
-        verts[gtid.x].color = HashColor(colorId);
+        
+        verts[gtid.x].color = !sceneBuffer.debugLodError ? HashColor(colorId) : (traverse ? float3(0.0, 1.0, 0.0) : float3(1.0, 0.0, 0.0));
         verts[gtid.x].uv = float2(0.0, 0.0);
     }
 

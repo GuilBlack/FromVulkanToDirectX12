@@ -399,10 +399,18 @@ MComPtr<ID3D12PipelineState> meshletLodDebugPipelineState;
 MComPtr<ID3D12PipelineState> meshletLodDebugBoundsPipelineState;
 bool useMeshletLodDebugBounds = false;
 
+MComPtr<ID3D12RootSignature> traversalRunRootSig;
+MComPtr<ID3D12PipelineState> traversalRunPipelineState;
+
+MComPtr<ID3D12RootSignature> computeInitRootSig;
+MComPtr<ID3D12PipelineState> computeInitPipelineState;
+
 
 // === Scene Objects === /* 0009 */
 
 MComPtr<ID3D12DescriptorHeap> pbrSphereSRVHeap;
+MComPtr<ID3D12DescriptorHeap> uavCPUHeap;
+MComPtr<ID3D12DescriptorHeap> uavGPUHeap;
 
 struct FrustumPlane
 {
@@ -410,6 +418,18 @@ struct FrustumPlane
 	float     padding;
 	SA::Vec3f position;
 	float     padding2;
+};
+
+constexpr uint32_t maxTraversalInfo = 1024 * 512; // arbitrary
+constexpr uint32_t maxRenderClusters = 1024 * 512; // arbitrary
+struct TraversalInfo
+{
+	uint32_t ObjIdx;
+	union
+	{
+		uint32_t NodeIdx;
+		uint32_t ClusterIdx;
+	};
 };
 // = Camera Buffer =
 struct SceneUBO
@@ -421,6 +441,13 @@ struct SceneUBO
 	SA::Vec3f    position;
 	uint32_t     useOldPlanes{};
 	uint32_t     debugGroups{};
+	uint32_t     maxTraversalInfo{ 1024 * 512 };// arbitrary
+	uint32_t     maxRenderClusters{ 1024 * 512 };// arbitrary
+	float        nearPlane{};
+	float        farPlane{};
+	float        errorOverDistance{ 1.0f };
+	uint32_t     debugLodError{true};
+	uint32_t     totalNodes{ 0 };
 };
 SceneUBO sceneUBO;
 
@@ -443,6 +470,17 @@ MComPtr<ID3D12Resource> sphereObjectBuffer;
 MComPtr<ID3D12Resource> otherObjectBuffer;
 constexpr uint32_t objectCount = 1;
 constexpr uint32_t objectCountSqrt = 1;
+
+struct UAVBufferResource
+{
+	MComPtr<ID3D12Resource> buffer;
+	D3D12_GPU_DESCRIPTOR_HANDLE gpuHandle;
+	D3D12_CPU_DESCRIPTOR_HANDLE cpuHandle;
+};
+UAVBufferResource renderClustersBuffer;
+UAVBufferResource traversalInfoBuffer;
+UAVBufferResource traversalCounterBuffer;
+MComPtr<ID3D12Resource> dumpUav;
 
 // = PointLights Buffer =
 struct PointLightUBO
@@ -567,6 +605,17 @@ bool SubmitBufferToGPU(MComPtr<ID3D12Resource> _gpuBuffer, uint64_t _size, const
 	cmdAllocs[0]->Reset();
 	cmdList->Reset(cmdAllocs[0].Get(), nullptr);
 
+	return true;
+}
+
+bool SubmitAndWait()
+{
+	cmdList->Close();
+	ID3D12CommandList* cmdListsArr[] = { cmdList.Get() };
+	graphicsQueue->ExecuteCommandLists(1, cmdListsArr);
+	WaitDeviceIdle();
+	cmdAllocs[0]->Reset();
+	cmdList->Reset(cmdAllocs[0].Get(), nullptr);
 	return true;
 }
 
@@ -752,12 +801,15 @@ struct Mesh
 };
 
 MComPtr<ID3D12Resource> CreateDefaultBuffer(void* data, uint64_t size, std::wstring bufferName,
-											D3D12_RESOURCE_STATES finalState = D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE)
+											D3D12_RESOURCE_STATES finalState = D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE,
+											D3D12_RESOURCE_FLAGS flags = D3D12_RESOURCE_FLAG_NONE)
 {
 	const D3D12_HEAP_PROPERTIES heap{
 			.Type = D3D12_HEAP_TYPE_DEFAULT,
 	};
 	CD3DX12_RESOURCE_DESC desc = CD3DX12_RESOURCE_DESC::Buffer(size);
+	desc.Flags = flags;
+
 	MComPtr<ID3D12Resource> buffer;
 	HRESULT hr = device->CreateCommittedResource(
 		&heap, D3D12_HEAP_FLAG_NONE, 
@@ -1341,7 +1393,7 @@ Node GrpToLeafNode(const Group& grp, uint32_t grpIdx)
 	node.radius				= grp.radius;
 	node.error				= grp.error;
 	node.firstChildOrGroup	= grpIdx;
-	node.childCount			= 0;
+	node.childCount			= grp.clusterCount;
 	node.isLeaf				= 1;
 	return node;
 }
@@ -1661,6 +1713,24 @@ MComPtr<ID3D12Resource> rustedIron2AlbedoTexture; // VkImage + VkDeviceMemory ->
 MComPtr<ID3D12Resource> rustedIron2NormalTexture;
 MComPtr<ID3D12Resource> rustedIron2MetallicTexture;
 MComPtr<ID3D12Resource> rustedIron2RoughnessTexture;
+
+void ClearComputeUAVs()
+{
+	uint32_t initValues[4] = { ~0u, ~0u, ~0u, ~0u };
+	std::vector<ID3D12DescriptorHeap*> heaps = { uavGPUHeap.Get() };
+	cmdList->SetDescriptorHeaps(1, heaps.data());
+	cmdList->ClearUnorderedAccessViewUint(renderClustersBuffer.gpuHandle, renderClustersBuffer.cpuHandle,
+										  renderClustersBuffer.buffer.Get(), initValues, 0, nullptr);
+	cmdList->ClearUnorderedAccessViewUint(traversalInfoBuffer.gpuHandle, traversalInfoBuffer.cpuHandle,
+										  traversalInfoBuffer.buffer.Get(), initValues, 0, nullptr);
+	initValues[0] = 0u;
+	initValues[1] = 0u;
+	initValues[2] = 0u;
+	initValues[3] = 0u;
+
+	cmdList->ClearUnorderedAccessViewUint(traversalCounterBuffer.gpuHandle, traversalCounterBuffer.cpuHandle,
+										  traversalCounterBuffer.buffer.Get(), initValues, 0, nullptr);
+}
 
 int main()
 {
@@ -2708,18 +2778,74 @@ int main()
 					}
 				}
 			#pragma endregion
+
+			#pragma region CLOD Compute
+				{
+					MComPtr<ID3DBlob> traversalRunComputeShader = CompileShader(L"Resources/Shaders/HLSL/TraversalRun.hlsl", L"main", L"cs_6_5");
+					if (!traversalRunComputeShader)
+						return EXIT_FAILURE;
+					HRESULT hres = device->CreateRootSignature(0, traversalRunComputeShader->GetBufferPointer(), traversalRunComputeShader->GetBufferSize(), IID_PPV_ARGS(&traversalRunRootSig));
+					if (FAILED(hres))
+					{
+						SA_LOG(L"Create Traversal Run Compute Root Signature failed!", Error, DX12, (L"Error Code: %1", hres));
+						return EXIT_FAILURE;
+					}
+					SA_LOG(L"Create Traversal Run Compute Root Signature success.", Info, DX12, traversalRunRootSig.Get());
+					traversalRunRootSig->SetName(L"TraversalRunRootSig");
+
+					D3D12_COMPUTE_PIPELINE_STATE_DESC computePSODesc{};
+					computePSODesc.pRootSignature = traversalRunRootSig.Get();
+					computePSODesc.CS = {
+						.pShaderBytecode = traversalRunComputeShader->GetBufferPointer(),
+						.BytecodeLength = traversalRunComputeShader->GetBufferSize()
+					};
+					device->CreateComputePipelineState(&computePSODesc, IID_PPV_ARGS(&traversalRunPipelineState));
+					if (FAILED(hres))
+					{
+						SA_LOG(L"Create Traversal Run Compute Pipeline State failed!", Error, DX12, (L"Error Code: %1", hres));
+						return EXIT_FAILURE;
+					}
+					traversalRunPipelineState->SetName(L"TraversalRunPipelineState");
+				}
+
+				{
+					MComPtr<ID3DBlob> computeInitShader = CompileShader(L"Resources/Shaders/HLSL/ComputeInit.hlsl", L"main", L"cs_6_5");
+					if (!computeInitShader)
+						return EXIT_FAILURE;
+					HRESULT hres = device->CreateRootSignature(0, computeInitShader->GetBufferPointer(), computeInitShader->GetBufferSize(), IID_PPV_ARGS(&computeInitRootSig));
+					if (FAILED(hres))
+					{
+						SA_LOG(L"Create Compute Init Root Signature failed!", Error, DX12, (L"Error Code: %1", hres));
+						return EXIT_FAILURE;
+					}
+					SA_LOG(L"Create Compute Init Root Signature success.", Info, DX12, computeInitRootSig.Get());
+					computeInitRootSig->SetName(L"ComputeInitRootSig");
+
+					D3D12_COMPUTE_PIPELINE_STATE_DESC computePSODesc{};
+					computePSODesc.pRootSignature = computeInitRootSig.Get();
+					computePSODesc.CS = {
+						.pShaderBytecode = computeInitShader->GetBufferPointer(),
+						.BytecodeLength = computeInitShader->GetBufferSize()
+					};
+					device->CreateComputePipelineState(&computePSODesc, IID_PPV_ARGS(&computeInitPipelineState));
+					if (FAILED(hres))
+					{
+						SA_LOG(L"Create Compute Init Pipeline State failed!", Error, DX12, (L"Error Code: %1", hres));
+						return EXIT_FAILURE;
+					}
+					computeInitPipelineState->SetName(L"ComputeInitPipelineState");
+				}
+			#pragma endregion
 			}
 		#pragma endregion // Pipeline /* 0008-I */
 
 
 			cmdList->Reset(cmdAllocs[0].Get(), nullptr);
 
-		#pragma region Scene Objects /* 0009-I */
-			// Scene Objects /* 0009-I */
+		#pragma region Misc Buffers For The Scene
 			if (true)
 			{
-			#pragma region PBR Sphere SRV View Heap
-				// PBR Sphere SRV View Heap
+			#pragma region View Heaps
 				{
 					/**
 					* Allocate Heap to emplace image/buffer views for future bindings.
@@ -2731,19 +2857,48 @@ int main()
 						.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE
 					};
 
-					const HRESULT hrCreateHeap = device->CreateDescriptorHeap(&desc, IID_PPV_ARGS(&pbrSphereSRVHeap));
+					HRESULT hrCreateHeap = device->CreateDescriptorHeap(&desc, IID_PPV_ARGS(&pbrSphereSRVHeap));
 					if (FAILED(hrCreateHeap))
 					{
 						SA_LOG(L"Create PBR Sphere SRV ViewHeap failed.", Error, DX12, (L"Error code: %1", hrCreateHeap));
 						return EXIT_FAILURE;
 					}
-					else
-					{
-						const LPCWSTR name = L"PBR Sphere SRV ViewHeap";
-						pbrSphereSRVHeap->SetName(name);
+					LPCWSTR name = L"PBR Sphere SRV ViewHeap";
+					pbrSphereSRVHeap->SetName(name);
 
-						SA_LOG(L"Create PBR Sphere SRV ViewHeap success.", Info, DX12, (L"\"%1\" [%2]", name, pbrSphereSRVHeap.Get()));
+					SA_LOG(L"Create PBR Sphere SRV ViewHeap success.", Info, DX12, (L"\"%1\" [%2]", name, pbrSphereSRVHeap.Get()));
+
+
+					D3D12_DESCRIPTOR_HEAP_DESC uavCPUDesc{
+						.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+						.NumDescriptors = 1000,
+						.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE
+					};
+					const HRESULT hrCreateUAVHeap = device->CreateDescriptorHeap(&uavCPUDesc, IID_PPV_ARGS(&uavCPUHeap));
+					if (FAILED(hrCreateUAVHeap))
+					{
+						SA_LOG(L"Create UAV CPU Heap failed.", Error, DX12, (L"Error code: %1", hrCreateUAVHeap));
+						return EXIT_FAILURE;
 					}
+					name = L"UAV CPU Heap";
+					uavCPUHeap->SetName(name);
+					SA_LOG(L"Create UAV CPU Heap success.", Info, DX12, (L"\"%1\" [%2]", name, uavCPUHeap.Get()));
+
+
+					D3D12_DESCRIPTOR_HEAP_DESC uavGPUDesc{
+						.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+						.NumDescriptors = 1000,
+						.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE
+					};
+
+					hrCreateHeap = device->CreateDescriptorHeap(&uavGPUDesc, IID_PPV_ARGS(&uavGPUHeap));
+					if (FAILED(hrCreateHeap))
+					{
+						SA_LOG(L"Create UAV GPU Heap failed.", Error, DX12, (L"Error code: %1", hrCreateHeap));
+						return EXIT_FAILURE;
+					}
+					name = L"UAV GPU Heap";
+					uavGPUHeap->SetName(name);
 				}
 			#pragma endregion
 
@@ -2775,13 +2930,10 @@ int main()
 							SA_LOG((L"Create Camera Buffer [%1] failed!", i), Error, DX12, (L"Error code: %1", hrBufferCreated));
 							return EXIT_FAILURE;
 						}
-						else
-						{
-							const std::wstring name = L"CameraBuffer [" + std::to_wstring(i) + L"]";
-							sceneBuffers[i]->SetName(name.c_str());
+						const std::wstring name = L"CameraBuffer [" + std::to_wstring(i) + L"]";
+						sceneBuffers[i]->SetName(name.c_str());
 
-							SA_LOG((L"Create Camera Buffer [%1] success", i), Info, DX12, (L"\"%1\" [%2]", name, sceneBuffers[i].Get()));
-						}
+						SA_LOG((L"Create Camera Buffer [%1] success", i), Info, DX12, (L"\"%1\" [%2]", name, sceneBuffers[i].Get()));
 					}
 				}
 			#pragma endregion
@@ -2882,13 +3034,10 @@ int main()
 						SA_LOG(L"Create PointLights Buffer failed!", Error, DX12, (L"Error code: %1", hrBufferCreated));
 						return EXIT_FAILURE;
 					}
-					else
-					{
-						const LPCWSTR name = L"PointLightsBuffer";
-						pointLightBuffer->SetName(name);
+					const LPCWSTR name = L"PointLightsBuffer";
+					pointLightBuffer->SetName(name);
 
-						SA_LOG(L"Create PointLights Buffer success", Info, DX12, (L"\"%1\" [%2]", name, pointLightBuffer.Get()));
-					}
+					SA_LOG(L"Create PointLights Buffer success", Info, DX12, (L"\"%1\" [%2]", name, pointLightBuffer.Get()));
 
 
 					std::array<PointLightUBO, pointLightNum> pointlightsUBO{
@@ -2929,8 +3078,119 @@ int main()
 					}
 				}
 			#pragma endregion
+
+			#pragma region Cluster Utils Buffers
+				{
+					const D3D12_HEAP_PROPERTIES heap{
+						.Type = D3D12_HEAP_TYPE_DEFAULT,
+					};
+					D3D12_RESOURCE_DESC desc = CD3DX12_RESOURCE_DESC::Buffer(sizeof(TraversalInfo) * maxRenderClusters, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+					HRESULT hrBufferCreated = device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&renderClustersBuffer.buffer));
+					if (FAILED(hrBufferCreated))
+					{
+						SA_LOG(L"Create Render Clusters Buffer failed!", Error, DX12, (L"Error code: %1", hrBufferCreated));
+						return EXIT_FAILURE;
+					}
+					renderClustersBuffer.buffer->SetName(L"RenderClustersBuffer");
+
+					desc = CD3DX12_RESOURCE_DESC::Buffer(sizeof(TraversalInfo) * maxTraversalInfo, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+					hrBufferCreated = device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&traversalInfoBuffer.buffer));
+					if (FAILED(hrBufferCreated))
+					{
+						SA_LOG(L"Create Traversal Info Buffer failed!", Error, DX12, (L"Error code: %1", hrBufferCreated));
+						return EXIT_FAILURE;
+					}
+					traversalInfoBuffer.buffer->SetName(L"TraversalInfoBuffer");
+
+					desc = CD3DX12_RESOURCE_DESC::Buffer(sizeof(uint32_t) * 4, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+					hrBufferCreated = device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&traversalCounterBuffer.buffer));
+					if (FAILED(hrBufferCreated))
+					{
+						SA_LOG(L"Create Traversal Counter Buffer failed!", Error, DX12, (L"Error code: %1", hrBufferCreated));
+						return EXIT_FAILURE;
+					}
+					traversalCounterBuffer.buffer->SetName(L"TraversalCounterBuffer");
+
+					desc = CD3DX12_RESOURCE_DESC::Buffer(sizeof(uint32_t) * 32 * 100, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+					hrBufferCreated = device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&dumpUav));
+                    dumpUav->SetName(L"DumpUAVBuffer");
+
+
+					D3D12_RESOURCE_BARRIER barrier = CD3DX12_RESOURCE_BARRIER::Transition(traversalCounterBuffer.buffer.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+					cmdList->ResourceBarrier(1, &barrier);
+					barrier = CD3DX12_RESOURCE_BARRIER::Transition(traversalInfoBuffer.buffer.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+					cmdList->ResourceBarrier(1, &barrier);
+					barrier = CD3DX12_RESOURCE_BARRIER::Transition(renderClustersBuffer.buffer.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+					cmdList->ResourceBarrier(1, &barrier);
+					barrier = CD3DX12_RESOURCE_BARRIER::Transition(dumpUav.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+					cmdList->ResourceBarrier(1, &barrier);
+
+					SubmitAndWait();
+				}
+				{
+					const uint32_t uavCPUOffset = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+					CD3DX12_CPU_DESCRIPTOR_HANDLE nonShaderVisibleHandle = CD3DX12_CPU_DESCRIPTOR_HANDLE(uavCPUHeap->GetCPUDescriptorHandleForHeapStart(), 0, uavCPUOffset);
+					const uint32_t uavGPUOffset = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+					CD3DX12_GPU_DESCRIPTOR_HANDLE shaderVisibleGPUHandle = CD3DX12_GPU_DESCRIPTOR_HANDLE(uavGPUHeap->GetGPUDescriptorHandleForHeapStart(), 0, uavGPUOffset);
+					CD3DX12_CPU_DESCRIPTOR_HANDLE shaderVisibleCPUHandle = CD3DX12_CPU_DESCRIPTOR_HANDLE(uavGPUHeap->GetCPUDescriptorHandleForHeapStart(), 0, uavGPUOffset);
+					{
+						D3D12_UNORDERED_ACCESS_VIEW_DESC uavDesc{
+							.Format = DXGI_FORMAT_R32_TYPELESS,
+							.ViewDimension = D3D12_UAV_DIMENSION_BUFFER,
+							.Buffer{
+								.FirstElement = 0,
+								.NumElements = (maxRenderClusters * sizeof(TraversalInfo)) / sizeof(uint32_t),
+								.Flags = D3D12_BUFFER_UAV_FLAG_RAW
+							},
+						};
+						device->CreateUnorderedAccessView(renderClustersBuffer.buffer.Get(), nullptr, &uavDesc, shaderVisibleCPUHandle);
+						renderClustersBuffer.gpuHandle = shaderVisibleGPUHandle;
+						device->CreateUnorderedAccessView(renderClustersBuffer.buffer.Get(), nullptr, &uavDesc, nonShaderVisibleHandle);
+						renderClustersBuffer.cpuHandle = nonShaderVisibleHandle;
+					}
+					nonShaderVisibleHandle.Offset(uavCPUOffset);
+					shaderVisibleGPUHandle.Offset(uavGPUOffset);
+					shaderVisibleCPUHandle.Offset(uavGPUOffset);
+					{
+						D3D12_UNORDERED_ACCESS_VIEW_DESC uavDesc{
+							.Format = DXGI_FORMAT_R32_TYPELESS,
+							.ViewDimension = D3D12_UAV_DIMENSION_BUFFER,
+							.Buffer{
+								.FirstElement = 0,
+								.NumElements = (maxTraversalInfo * sizeof(TraversalInfo)) / sizeof(uint32_t),
+								.Flags = D3D12_BUFFER_UAV_FLAG_RAW
+							},
+						};
+						device->CreateUnorderedAccessView(traversalInfoBuffer.buffer.Get(), nullptr, &uavDesc, shaderVisibleCPUHandle);
+						traversalInfoBuffer.gpuHandle = shaderVisibleGPUHandle;
+						device->CreateUnorderedAccessView(traversalInfoBuffer.buffer.Get(), nullptr, &uavDesc, nonShaderVisibleHandle);
+						traversalInfoBuffer.cpuHandle = nonShaderVisibleHandle;
+					}
+					nonShaderVisibleHandle.Offset(uavCPUOffset);
+					shaderVisibleGPUHandle.Offset(uavGPUOffset);
+					shaderVisibleCPUHandle.Offset(uavGPUOffset);
+					{
+						D3D12_UNORDERED_ACCESS_VIEW_DESC uavDesc{
+							.Format = DXGI_FORMAT_R32_TYPELESS,
+							.ViewDimension = D3D12_UAV_DIMENSION_BUFFER,
+							.Buffer{
+								.FirstElement = 0,
+								.NumElements = (4 * sizeof(uint32_t)) / sizeof(uint32_t),
+								.Flags = D3D12_BUFFER_UAV_FLAG_RAW
+							},
+						};
+						device->CreateUnorderedAccessView(traversalCounterBuffer.buffer.Get(), nullptr, &uavDesc, shaderVisibleCPUHandle);
+						traversalCounterBuffer.gpuHandle = shaderVisibleGPUHandle;
+						device->CreateUnorderedAccessView(traversalCounterBuffer.buffer.Get(), nullptr, &uavDesc, nonShaderVisibleHandle);
+						traversalCounterBuffer.cpuHandle = nonShaderVisibleHandle;
+					}
+					ClearComputeUAVs();
+
+					SubmitAndWait();
+				}
+			#pragma endregion
 			}
-		#pragma endregion // Scene Objects /* 0009-I */
+		#pragma endregion
 
 		#pragma region Resources /* 0010-I */
 			// Resources /* 0010-I */
@@ -3479,26 +3739,33 @@ int main()
 
 						return FrustumPlane{ n, 0, a, 0 };
 					};
-			#pragma region Update camera
-				// Update camera.
+				auto clodErrorOverDist = [](float fovRad, float pixelError, float viewportY)
+					{
+						return tanf(fovRad * 0.5f) * pixelError / viewportY;
+					};
+			#pragma region Update scene data
 				auto sceneBuffer = sceneBuffers[swapchainFrameIndex];
 				{
 					// Fill Data with updated values.
-					sceneUBO.view = cameraTr.Matrix();
+					sceneUBO.view = cameraTr.Matrix().GetInversed();
 					const SA::Mat4f perspective = SA::Mat4f::MakePerspective(cameraFOV, float(windowSize.x) / float(windowSize.y), cameraNear, cameraFar);
-					sceneUBO.invViewProj = perspective * sceneUBO.view.GetInversed();
-					auto invViewInvProj = sceneUBO.view * (perspective).GetInversed();
+					sceneUBO.invViewProj = perspective * sceneUBO.view;
+					auto ndcToWorld = sceneUBO.view.GetInversed() * (perspective).GetInversed();
 					sceneUBO.position = cameraTr.position;
+					sceneUBO.nearPlane = cameraNear;
+					sceneUBO.farPlane = cameraFar;
+					sceneUBO.errorOverDistance = clodErrorOverDist(cameraFOV * SA::Maths::DegToRad<float>, 1.0f, float(windowSize.y));
+					sceneUBO.totalNodes = (uint32_t)bunnyLodMesh.meshCPU.nodes.size();
 
 					std::array<SA::Vec4f, 8> frustumCorners{};
-					frustumCorners[0] = invViewInvProj * SA::Vec4f{ -1.0f,  1.0f,  0.0f, 1.0f }; // near top left
-					frustumCorners[1] = invViewInvProj * SA::Vec4f{  1.0f,  1.0f,  0.0f, 1.0f }; // near top right
-					frustumCorners[2] = invViewInvProj * SA::Vec4f{ -1.0f, -1.0f,  0.0f, 1.0f }; // near bottom left
-					frustumCorners[3] = invViewInvProj * SA::Vec4f{  1.0f, -1.0f,  0.0f, 1.0f }; // near bottom right
-					frustumCorners[4] = invViewInvProj * SA::Vec4f{ -1.0f,  1.0f,  1.0f, 1.0f }; // far top left
-					frustumCorners[5] = invViewInvProj * SA::Vec4f{  1.0f,  1.0f,  1.0f, 1.0f }; // far top right
-					frustumCorners[6] = invViewInvProj * SA::Vec4f{ -1.0f, -1.0f,  1.0f, 1.0f }; // far bottom left
-					frustumCorners[7] = invViewInvProj * SA::Vec4f{  1.0f, -1.0f,  1.0f, 1.0f }; // far bottom right
+					frustumCorners[0] = ndcToWorld * SA::Vec4f{ -1.0f,  1.0f,  0.0f, 1.0f }; // near top left
+					frustumCorners[1] = ndcToWorld * SA::Vec4f{  1.0f,  1.0f,  0.0f, 1.0f }; // near top right
+					frustumCorners[2] = ndcToWorld * SA::Vec4f{ -1.0f, -1.0f,  0.0f, 1.0f }; // near bottom left
+					frustumCorners[3] = ndcToWorld * SA::Vec4f{  1.0f, -1.0f,  0.0f, 1.0f }; // near bottom right
+					frustumCorners[4] = ndcToWorld * SA::Vec4f{ -1.0f,  1.0f,  1.0f, 1.0f }; // far top left
+					frustumCorners[5] = ndcToWorld * SA::Vec4f{  1.0f,  1.0f,  1.0f, 1.0f }; // far top right
+					frustumCorners[6] = ndcToWorld * SA::Vec4f{ -1.0f, -1.0f,  1.0f, 1.0f }; // far bottom left
+					frustumCorners[7] = ndcToWorld * SA::Vec4f{  1.0f, -1.0f,  1.0f, 1.0f }; // far bottom right
 
 					for (uint32_t i = 0; i < 8; ++i)
 					{
@@ -3566,6 +3833,86 @@ int main()
 
 					auto sceneColorRT = swapchainImages[swapchainFrameIndex];
 
+					{
+						ClearComputeUAVs();
+
+						cmd->SetComputeRootSignature(computeInitRootSig.Get());
+
+						cmd->SetComputeRoot32BitConstant(0, (uint32_t)objectCount, 0);
+						cmd->SetComputeRootConstantBufferView(1, sceneBuffer->GetGPUVirtualAddress());
+
+						cmd->SetComputeRootShaderResourceView(2, otherObjectBuffer->GetGPUVirtualAddress());
+						cmd->SetComputeRootShaderResourceView(3, bunnyLodMesh.nodeBuffer->GetGPUVirtualAddress());
+
+						cmd->SetComputeRootUnorderedAccessView(4, traversalCounterBuffer.buffer->GetGPUVirtualAddress());
+						cmd->SetComputeRootUnorderedAccessView(5, traversalInfoBuffer.buffer->GetGPUVirtualAddress());
+
+						cmd->SetPipelineState(computeInitPipelineState.Get());
+						cmd->Dispatch(1,1,1);
+
+						D3D12_RESOURCE_BARRIER barriers1[2] = {
+							{
+								.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV,
+								.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE,
+								.UAV = {
+									.pResource = traversalCounterBuffer.buffer.Get(),
+								},
+							},
+							{
+								.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV,
+								.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE,
+								.UAV = {
+									.pResource = traversalInfoBuffer.buffer.Get(),
+								},
+							},
+						};
+
+						cmd->ResourceBarrier(2, barriers1);
+
+						cmd->SetComputeRootSignature(traversalRunRootSig.Get());
+						cmd->SetComputeRootConstantBufferView(0, sceneBuffer->GetGPUVirtualAddress());
+						cmd->SetComputeRootShaderResourceView(1, otherObjectBuffer->GetGPUVirtualAddress());
+
+						cmd->SetComputeRootShaderResourceView(2, bunnyLodMesh.clusterBuffer->GetGPUVirtualAddress());
+						cmd->SetComputeRootShaderResourceView(3, bunnyLodMesh.groupBuffer->GetGPUVirtualAddress());
+						cmd->SetComputeRootShaderResourceView(4, bunnyLodMesh.nodeBuffer->GetGPUVirtualAddress());
+
+						cmd->SetComputeRootUnorderedAccessView(5, traversalCounterBuffer.buffer->GetGPUVirtualAddress());
+						cmd->SetComputeRootUnorderedAccessView(6, traversalInfoBuffer.buffer->GetGPUVirtualAddress());
+						cmd->SetComputeRootUnorderedAccessView(7, renderClustersBuffer.buffer->GetGPUVirtualAddress());
+						cmd->SetComputeRootUnorderedAccessView(8, dumpUav->GetGPUVirtualAddress());
+
+						cmd->SetPipelineState(traversalRunPipelineState.Get());
+						//cmd->Dispatch(4096 / 32, 1, 1);
+						cmd->Dispatch(1, 1, 1);
+
+						D3D12_RESOURCE_BARRIER barriers2[3] = {
+							{
+								.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV,
+								.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE,
+								.UAV = {
+									.pResource = traversalCounterBuffer.buffer.Get(),
+								},
+							},
+							{
+								.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV,
+								.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE,
+								.UAV = {
+									.pResource = traversalInfoBuffer.buffer.Get(),
+								},
+							},
+							{
+								.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV,
+								.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE,
+								.UAV = {
+									.pResource = renderClustersBuffer.buffer.Get(),
+								},
+							},
+						};
+
+						cmd->ResourceBarrier(3, barriers2);
+					}
+
 					/**
 					* 0006-U0
 					*
@@ -3574,7 +3921,7 @@ int main()
 					* DirectX12 doesn't have such system and must manage RenderTargets manually.
 					*/
 					{
-						// Color Transition to RenderTarget.
+					#pragma region Clear and Set Render Target
 						const D3D12_RESOURCE_BARRIER barrier{
 							.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
 							.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE,
@@ -3589,7 +3936,6 @@ int main()
 						cmd->ResourceBarrier(1, &barrier);
 
 
-						// Bind & Clear /* 0006-U1 */
 						{
 							// Access current frame allocated view.
 							D3D12_CPU_DESCRIPTOR_HANDLE rtvHandle = sceneRTViewHeap->GetCPUDescriptorHandleForHeapStart();
@@ -3603,6 +3949,7 @@ int main()
 							cmd->ClearDepthStencilView(dsvHandle, D3D12_CLEAR_FLAG_DEPTH, sceneDepthClearValue.DepthStencil.Depth, sceneDepthClearValue.DepthStencil.Stencil, 0, nullptr);
 						}
 					}
+				#pragma endregion
 
 
 					// Pipeline commons
@@ -3684,7 +4031,7 @@ int main()
 
 					if constexpr (renderBunnyLodMeshDebug)
 					{
-						auto& levelHigh = bunnyLodMesh.meshCPU.levels[0];
+						auto& levelHigh = bunnyLodMesh.meshCPU.levels[1];
 						uint32_t numClusters = 0;
 						uint32_t clustersStart = bunnyLodMesh.meshCPU.groups[levelHigh.groupBegin].clusterStart;
 						for (uint32_t i = levelHigh.groupBegin; i < levelHigh.groupBegin + levelHigh.groupCount; ++i)
@@ -3719,6 +4066,19 @@ int main()
 							cmd->DispatchMesh(((uint32_t)(numClusters) * (uint32_t)objectCount + 31) / 32, 1, 1);
 						}
 					}
+					SA::Mat4f instanceToWorld = sceneUBO.view * SA::Mat4f::MakeTranslation(SA::Vec3f{ 0, 0, 30.0f });
+					Group group = bunnyLodMesh.meshCPU.groups[114];
+					SA::Vec4f viewCenter = instanceToWorld * SA::Vec4f(group.center, 1.0f);
+					float sphereDistance = SA::Vec3f(viewCenter.x, viewCenter.y, viewCenter.z).Length();
+					float errorDistance = std::max(sceneUBO.nearPlane, sphereDistance);
+					float errorOverDistance = group.error / errorDistance;
+					bool isInView = errorOverDistance >= sceneUBO.errorOverDistance;
+
+					if (isInView)
+					{
+						SA_LOG(L"Cluster in view", Info, DX12, (L"Cluster center: (%1, %2, %3), Error over distance: %4", group.center.x, group.center.y, group.center.z, errorOverDistance));
+					}
+
 
 					// Manage RenderTargets for present. 0006-U2
 					{

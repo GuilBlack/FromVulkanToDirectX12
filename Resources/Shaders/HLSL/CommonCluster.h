@@ -14,6 +14,8 @@ struct Cluster
     uint32_t     Padding;
 };
 
+#define invalidRefinedGroup 0xFFFFFFFF
+
 struct ClusterGroup
 {
     float3      center;
@@ -38,3 +40,15 @@ struct ClusterNode
     uint32_t    childCount;
     uint32_t    isLeaf; // 1 = leaf, 0 = internal
 };
+
+struct TraversalInfo
+{
+    uint objectIdx;
+    uint nodeIdx;
+};
+
+#define invalidTraversalInfo (~0)
+#define traversalInfoReadCounter 0 // read task pointer
+#define traversalTaskCounter 1 // tasks in flight counter
+#define traversalInfoWriteCounter 2 // write task pointer
+#define renderClusterCounter 3
