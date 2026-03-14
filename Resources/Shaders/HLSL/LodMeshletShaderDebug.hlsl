@@ -125,23 +125,6 @@ void mainAS(
 //     return tri;
 // }
 
-// https://www.shadertoy.com/view/XlGcRh
-uint fmix(uint h)
-{
-    h ^= h >> 16;
-    h *= 0x85ebca6bu;
-    h ^= h >> 13;
-    h *= 0xc2b2ae35u;
-    h ^= h >> 16;
-    return h;
-}
-
-float3 HashColor(uint id)
-{
-    uint hash = fmix(id);
-    return float3((hash & 0xFF) / 255.0, ((hash >> 8) & 0xFF) / 255.0, ((hash >> 16) & 0xFF) / 255.0);
-}
-
 static const uint DEBUG_BOUND_VERT_COUNT = 6;
 static const uint DEBUG_BOUND_TRI_COUNT = 8;
 

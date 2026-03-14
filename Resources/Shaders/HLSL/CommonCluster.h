@@ -47,6 +47,30 @@ struct TraversalInfo
     uint nodeIdx;
 };
 
+struct DispatchMeshIndirectCommand
+{
+    uint threadGroupCountX;
+    uint threadGroupCountY;
+    uint threadGroupCountZ;
+};
+
+// https://www.shadertoy.com/view/XlGcRh
+uint fmix(uint h)
+{
+    h ^= h >> 16;
+    h *= 0x85ebca6bu;
+    h ^= h >> 13;
+    h *= 0xc2b2ae35u;
+    h ^= h >> 16;
+    return h;
+}
+
+float3 HashColor(uint id)
+{
+    uint hash = fmix(id);
+    return float3((hash & 0xFF) / 255.0, ((hash >> 8) & 0xFF) / 255.0, ((hash >> 16) & 0xFF) / 255.0);
+}
+
 #define invalidTraversalInfo (~0)
 #define traversalInfoReadCounter 0 // read task pointer
 #define traversalTaskCounter 1 // tasks in flight counter

@@ -405,6 +405,13 @@ MComPtr<ID3D12PipelineState> traversalRunPipelineState;
 MComPtr<ID3D12RootSignature> computeInitRootSig;
 MComPtr<ID3D12PipelineState> computeInitPipelineState;
 
+MComPtr<ID3D12RootSignature> computeDispatchInfoRootSig;
+MComPtr<ID3D12PipelineState> computeDispatchInfoPipelineState;
+
+MComPtr<ID3D12CommandSignature> clusterLodDispatchCommandSignature;
+MComPtr<ID3D12RootSignature> clusterLodDispatchRootSig;
+MComPtr<ID3D12PipelineState> clusterLodDispatchPipelineState;
+
 
 // === Scene Objects === /* 0009 */
 
@@ -481,6 +488,7 @@ UAVBufferResource renderClustersBuffer;
 UAVBufferResource traversalInfoBuffer;
 UAVBufferResource traversalCounterBuffer;
 MComPtr<ID3D12Resource> dumpUav;
+MComPtr<ID3D12Resource> dispatchInfoBuffer;
 
 // = PointLights Buffer =
 struct PointLightUBO
@@ -1706,7 +1714,8 @@ Mesh		dragonMesh{};
 MeshLOD		bunnyLodMesh{};
 
 constexpr bool renderDragonMesh = false;
-constexpr bool renderBunnyLodMeshDebug = true;
+constexpr bool renderBunnyLodMeshDebug = false;
+constexpr bool renderBunnyLodClusters = true;
 
 // = RustedIron2 PBR =
 MComPtr<ID3D12Resource> rustedIron2AlbedoTexture; // VkImage + VkDeviceMemory -> ID3D12Resource
@@ -2696,18 +2705,7 @@ int main()
 						.BytecodeLength = meshletLodDebugPixel->GetBufferSize()
 					};
 					meshletLodDebugPSODesc.RTVFormats[0] = sceneColorFormat;
-					D3D12_FEATURE_DATA_FORMAT_SUPPORT formatSupport = {};
-					formatSupport.Format = sceneColorFormat;
-					HRESULT hr = device->CheckFeatureSupport(
-						D3D12_FEATURE_FORMAT_SUPPORT,
-						&formatSupport,
-						sizeof(formatSupport));
 
-					if (SUCCEEDED(hr))
-					{
-						bool blendable = (formatSupport.Support1 & D3D12_FORMAT_SUPPORT1_BLENDABLE) != 0;
-						SA_LOG(L"Scene Color Format " + std::to_wstring(sceneColorFormat) + L" support blendable: " + (blendable ? L"Yes" : L"No"), Info, DX12);
-					}
 					meshletLodDebugPSODesc.NumRenderTargets = 1;
 					meshletLodDebugPSODesc.DSVFormat = sceneDepthFormat;
 					meshletLodDebugPSODesc.RasterizerState = CD3DX12_RASTERIZER_DESC(D3D12_DEFAULT);
@@ -2734,10 +2732,10 @@ int main()
 
 					meshletLodDebugMesh = CompileShader(L"Resources/Shaders/HLSL/LodMeshletShaderDebug.hlsl", L"mainMS", L"ms_6_5", { L"DEBUG_CLUSTER_BOUNDS" });
 					if (meshletLodDebugMesh == nullptr)
-						return EXIT_FAILURE;
+					return EXIT_FAILURE;
 					meshletLodDebugPixel = CompileShader(L"Resources/Shaders/HLSL/LodMeshletShaderDebug.hlsl", L"mainPS", L"ps_6_5", { L"DEBUG_CLUSTER_BOUNDS" });
 					if (meshletLodDebugPixel == nullptr)
-						return EXIT_FAILURE;
+					return EXIT_FAILURE;
 
 					meshletLodDebugPSODesc.MS = {
 						.pShaderBytecode = meshletLodDebugMesh->GetBufferPointer(),
@@ -2778,6 +2776,81 @@ int main()
 					}
 				}
 			#pragma endregion
+
+			#pragma region Meshlet LOD Dispatch
+				{
+                    D3D12_INDIRECT_ARGUMENT_DESC argDesc = {};
+                    argDesc.Type = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH;
+					argDesc.UnorderedAccessView.RootParameterIndex = 3;
+
+                    D3D12_COMMAND_SIGNATURE_DESC sigDesc = {};
+                    sigDesc.ByteStride = sizeof(D3D12_DISPATCH_ARGUMENTS);
+                    sigDesc.NumArgumentDescs = 1;
+                    sigDesc.pArgumentDescs = &argDesc;
+                    sigDesc.NodeMask = 0;
+
+                    HRESULT hr = device->CreateCommandSignature(
+                        &sigDesc,
+                        nullptr, // no root args changed by the indirect command
+                        IID_PPV_ARGS(&clusterLodDispatchCommandSignature)
+                    );
+					if (FAILED(hr))
+					{
+						SA_LOG(L"Create Cluster LOD Dispatch Command Signature failed!", Error, DX12, (L"Error Code: %1", hr));
+						return EXIT_FAILURE;
+                    }
+
+                    MComPtr<ID3DBlob> clusterLodDispatchMS = CompileShader(L"Resources/Shaders/HLSL/ClusterLodDispatch.hlsl", L"mainMS", L"ms_6_5");
+                    if (!clusterLodDispatchMS)
+                        return EXIT_FAILURE;
+                    MComPtr<ID3DBlob> clusterLodDispatchPixel = CompileShader(L"Resources/Shaders/HLSL/ClusterLodDispatch.hlsl", L"mainPS", L"ps_6_5");
+                    if (!clusterLodDispatchPixel)
+                        return EXIT_FAILURE;
+
+                    HRESULT hres = device->CreateRootSignature(0, clusterLodDispatchMS->GetBufferPointer(), clusterLodDispatchMS->GetBufferSize(), IID_PPV_ARGS(&clusterLodDispatchRootSig));
+                    if (FAILED(hres))
+                    {
+                        SA_LOG(L"Create ClusterLodDispatchRootSig failed!", Error, DX12, (L"Error Code: %1", hres));
+                        return EXIT_FAILURE;
+                    }
+                    SA_LOG(L"Create ClusterLodDispatchRootSig success.", Info, DX12, clusterLodDispatchRootSig.Get());
+                    clusterLodDispatchRootSig->SetName(L"ClusterLodDispatchRootSig");
+					D3DX12_MESH_SHADER_PIPELINE_STATE_DESC clusterLodDispatchPSODesc = {};
+                    clusterLodDispatchPSODesc.pRootSignature = clusterLodDispatchRootSig.Get();
+					clusterLodDispatchPSODesc.MS = {
+						.pShaderBytecode = clusterLodDispatchMS->GetBufferPointer(),
+						.BytecodeLength = clusterLodDispatchMS->GetBufferSize()
+                    };
+					clusterLodDispatchPSODesc.PS = {
+						.pShaderBytecode = clusterLodDispatchPixel->GetBufferPointer(),
+						.BytecodeLength = clusterLodDispatchPixel->GetBufferSize()
+					};
+					clusterLodDispatchPSODesc.RTVFormats[0] = sceneColorFormat;
+
+                    clusterLodDispatchPSODesc.NumRenderTargets = 1;
+                    clusterLodDispatchPSODesc.DSVFormat = sceneDepthFormat;
+                    clusterLodDispatchPSODesc.RasterizerState = CD3DX12_RASTERIZER_DESC(D3D12_DEFAULT);
+                    clusterLodDispatchPSODesc.RasterizerState.FrontCounterClockwise = FALSE;
+                    clusterLodDispatchPSODesc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+                    clusterLodDispatchPSODesc.BlendState = CD3DX12_BLEND_DESC(D3D12_DEFAULT);
+                    clusterLodDispatchPSODesc.DepthStencilState = CD3DX12_DEPTH_STENCIL_DESC(D3D12_DEFAULT);
+                    clusterLodDispatchPSODesc.SampleMask = UINT_MAX;
+                    clusterLodDispatchPSODesc.SampleDesc = DefaultSampleDesc();
+                    auto psoStream = CD3DX12_PIPELINE_MESH_STATE_STREAM(clusterLodDispatchPSODesc);
+                    D3D12_PIPELINE_STATE_STREAM_DESC streamDesc = {
+                        .SizeInBytes = sizeof(psoStream),
+                        .pPipelineStateSubobjectStream = &psoStream
+                    };
+                    hres = device->CreatePipelineState(&streamDesc, IID_PPV_ARGS(&clusterLodDispatchPipelineState));
+					if (FAILED(hres))
+					{
+						SA_LOG(L"Create ClusterLodDispatchPipelineState failed!", Error, DX12, (L"Error Code: %1", hres));
+						return EXIT_FAILURE;
+					}
+					SA_LOG(L"Create ClusterLodDispatchPipelineState success.", Info, DX12, clusterLodDispatchPipelineState.Get());
+                    clusterLodDispatchPipelineState->SetName(L"ClusterLodDispatchPipelineState");
+				}
+            #pragma endregion
 
 			#pragma region CLOD Compute
 				{
@@ -2834,6 +2907,35 @@ int main()
 						return EXIT_FAILURE;
 					}
 					computeInitPipelineState->SetName(L"ComputeInitPipelineState");
+				}
+
+				{
+					MComPtr<ID3DBlob> computeDispatchInfoShader = CompileShader(L"Resources/Shaders/HLSL/ComputeDispatchInfo.hlsl", L"main", L"cs_6_5");
+					if (!computeDispatchInfoShader)
+						return EXIT_FAILURE;
+
+					HRESULT hres = device->CreateRootSignature(0, computeDispatchInfoShader->GetBufferPointer(), computeDispatchInfoShader->GetBufferSize(), IID_PPV_ARGS(&computeDispatchInfoRootSig));
+					if (FAILED(hres))
+					{
+						SA_LOG(L"Create Compute Dispatch Info Root Signature failed!", Error, DX12, (L"Error Code: %1", hres));
+						return EXIT_FAILURE;
+					}
+					SA_LOG(L"Create Compute Dispatch Info Root Signature success.", Info, DX12, computeDispatchInfoRootSig.Get());
+					computeDispatchInfoRootSig->SetName(L"ComputeDispatchInfoRootSig");
+
+					D3D12_COMPUTE_PIPELINE_STATE_DESC computePSODesc{};
+					computePSODesc.pRootSignature = computeDispatchInfoRootSig.Get();
+					computePSODesc.CS = {
+						.pShaderBytecode = computeDispatchInfoShader->GetBufferPointer(),
+						.BytecodeLength = computeDispatchInfoShader->GetBufferSize()
+					};
+					device->CreateComputePipelineState(&computePSODesc, IID_PPV_ARGS(&computeDispatchInfoPipelineState));
+					if (FAILED(hres))
+					{
+						SA_LOG(L"Create Compute Dispatch Info Pipeline State failed!", Error, DX12, (L"Error Code: %1", hres));
+						return EXIT_FAILURE;
+					}
+					computeDispatchInfoPipelineState->SetName(L"ComputeDispatchInfoPipelineState");
 				}
 			#pragma endregion
 			}
@@ -3113,8 +3215,16 @@ int main()
 
 					desc = CD3DX12_RESOURCE_DESC::Buffer(sizeof(uint32_t) * 32 * 100, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
 					hrBufferCreated = device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&dumpUav));
-                    dumpUav->SetName(L"DumpUAVBuffer");
+					dumpUav->SetName(L"DumpUAVBuffer");
 
+					desc = CD3DX12_RESOURCE_DESC::Buffer(sizeof(D3D12_DISPATCH_ARGUMENTS), D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+					hrBufferCreated = device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&dispatchInfoBuffer));
+					if (FAILED(hrBufferCreated))
+					{
+						SA_LOG(L"Create Dispatch Info Buffer failed!", Error, DX12, (L"Error code: %1", hrBufferCreated));
+						return EXIT_FAILURE;
+					}
+					dispatchInfoBuffer->SetName(L"DispatchInfoBuffer");
 
 					D3D12_RESOURCE_BARRIER barrier = CD3DX12_RESOURCE_BARRIER::Transition(traversalCounterBuffer.buffer.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 					cmdList->ResourceBarrier(1, &barrier);
@@ -3123,6 +3233,8 @@ int main()
 					barrier = CD3DX12_RESOURCE_BARRIER::Transition(renderClustersBuffer.buffer.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 					cmdList->ResourceBarrier(1, &barrier);
 					barrier = CD3DX12_RESOURCE_BARRIER::Transition(dumpUav.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+					cmdList->ResourceBarrier(1, &barrier);
+					barrier = CD3DX12_RESOURCE_BARRIER::Transition(dispatchInfoBuffer.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
 					cmdList->ResourceBarrier(1, &barrier);
 
 					SubmitAndWait();
@@ -3235,7 +3347,7 @@ int main()
 							}
 						}
 
-						if constexpr (renderBunnyLodMeshDebug)
+						if constexpr (renderBunnyLodMeshDebug || renderBunnyLodClusters)
 						{
 							path = "Resources/Models/Bunny.obj";
 							r = ImportMeshLod(path, L"Bunny", bunnyLodMesh);
@@ -3833,6 +3945,7 @@ int main()
 
 					auto sceneColorRT = swapchainImages[swapchainFrameIndex];
 
+                #pragma region Compute Pass: Clustered LoD Traversal
 					{
 						ClearComputeUAVs();
 
@@ -3850,24 +3963,11 @@ int main()
 						cmd->SetPipelineState(computeInitPipelineState.Get());
 						cmd->Dispatch(1,1,1);
 
-						D3D12_RESOURCE_BARRIER barriers1[2] = {
-							{
-								.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV,
-								.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE,
-								.UAV = {
-									.pResource = traversalCounterBuffer.buffer.Get(),
-								},
-							},
-							{
-								.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV,
-								.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE,
-								.UAV = {
-									.pResource = traversalInfoBuffer.buffer.Get(),
-								},
-							},
-						};
+						D3D12_RESOURCE_BARRIER barrier = CD3DX12_RESOURCE_BARRIER::UAV(traversalCounterBuffer.buffer.Get());
+						cmd->ResourceBarrier(1, &barrier);
+						barrier = CD3DX12_RESOURCE_BARRIER::UAV(traversalInfoBuffer.buffer.Get());
+						cmd->ResourceBarrier(1, &barrier);
 
-						cmd->ResourceBarrier(2, barriers1);
 
 						cmd->SetComputeRootSignature(traversalRunRootSig.Get());
 						cmd->SetComputeRootConstantBufferView(0, sceneBuffer->GetGPUVirtualAddress());
@@ -3886,32 +3986,30 @@ int main()
 						//cmd->Dispatch(4096 / 32, 1, 1);
 						cmd->Dispatch(1, 1, 1);
 
-						D3D12_RESOURCE_BARRIER barriers2[3] = {
-							{
-								.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV,
-								.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE,
-								.UAV = {
-									.pResource = traversalCounterBuffer.buffer.Get(),
-								},
-							},
-							{
-								.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV,
-								.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE,
-								.UAV = {
-									.pResource = traversalInfoBuffer.buffer.Get(),
-								},
-							},
-							{
-								.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV,
-								.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE,
-								.UAV = {
-									.pResource = renderClustersBuffer.buffer.Get(),
-								},
-							},
-						};
+						barrier = CD3DX12_RESOURCE_BARRIER::UAV(traversalCounterBuffer.buffer.Get());
+						cmd->ResourceBarrier(1, &barrier);
+						barrier = CD3DX12_RESOURCE_BARRIER::Transition(dispatchInfoBuffer.Get(), D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
-						cmd->ResourceBarrier(3, barriers2);
+						cmd->SetComputeRootSignature(computeDispatchInfoRootSig.Get());
+						cmd->SetComputeRootConstantBufferView(0, sceneBuffer->GetGPUVirtualAddress());
+
+						cmd->SetComputeRootUnorderedAccessView(1, traversalCounterBuffer.buffer->GetGPUVirtualAddress());
+						cmd->SetComputeRootUnorderedAccessView(2, dispatchInfoBuffer->GetGPUVirtualAddress());
+
+						cmd->SetPipelineState(computeDispatchInfoPipelineState.Get());
+						cmd->Dispatch(1, 1, 1);
+
+						barrier = CD3DX12_RESOURCE_BARRIER::UAV(renderClustersBuffer.buffer.Get());
+						cmd->ResourceBarrier(1, &barrier);
+						barrier = CD3DX12_RESOURCE_BARRIER::UAV(dispatchInfoBuffer.Get());
+						cmd->ResourceBarrier(1, &barrier);
+						barrier = CD3DX12_RESOURCE_BARRIER::UAV(traversalCounterBuffer.buffer.Get());
+						cmd->ResourceBarrier(1, &barrier);
+
+						barrier = CD3DX12_RESOURCE_BARRIER::Transition(dispatchInfoBuffer.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
+                        cmd->ResourceBarrier(1, &barrier);
 					}
+				#pragma endregion
 
 					/**
 					* 0006-U0
@@ -3959,7 +4057,7 @@ int main()
 					ID3D12DescriptorHeap* descriptorHeaps[] = { pbrSphereSRVHeap.Get() };
 					cmd->SetDescriptorHeaps(_countof(descriptorHeaps), descriptorHeaps);
 
-					// Lit Pipeline
+				#pragma region Lit Pipeline
 					{
 						/**
 						* 0011-U-1
@@ -4001,8 +4099,9 @@ int main()
 						//cmd->IASetIndexBuffer(&sphereMesh.IndexBufferView);
 						//cmd->DrawIndexedInstanced(sphereMesh.IndexCount, 1, 0, 0, 0);
 					}
+				#pragma endregion
 
-					// Meshlet Pipeline
+				#pragma region Meshlet Pipeline
 					if constexpr (renderDragonMesh)
 					{
 						cmd->SetGraphicsRootSignature(meshletRootSig.Get());
@@ -4028,7 +4127,9 @@ int main()
 						cmd->SetPipelineState(meshletPipelineState.Get());
 						cmd->DispatchMesh(((uint32_t)dragonMesh.NumMeshlets * (uint32_t)objectCount + 31) / 32, 1, 1);
 					}
+				#pragma endregion
 
+                #pragma region Meshlet LOD Debug
 					if constexpr (renderBunnyLodMeshDebug)
 					{
 						auto& levelHigh = bunnyLodMesh.meshCPU.levels[1];
@@ -4066,18 +4167,42 @@ int main()
 							cmd->DispatchMesh(((uint32_t)(numClusters) * (uint32_t)objectCount + 31) / 32, 1, 1);
 						}
 					}
-					SA::Mat4f instanceToWorld = sceneUBO.view * SA::Mat4f::MakeTranslation(SA::Vec3f{ 0, 0, 30.0f });
-					Group group = bunnyLodMesh.meshCPU.groups[114];
-					SA::Vec4f viewCenter = instanceToWorld * SA::Vec4f(group.center, 1.0f);
-					float sphereDistance = SA::Vec3f(viewCenter.x, viewCenter.y, viewCenter.z).Length();
-					float errorDistance = std::max(sceneUBO.nearPlane, sphereDistance);
-					float errorOverDistance = group.error / errorDistance;
-					bool isInView = errorOverDistance >= sceneUBO.errorOverDistance;
+// 					SA::Mat4f instanceToWorld = sceneUBO.view * SA::Mat4f::MakeTranslation(SA::Vec3f{ 0, 0, 30.0f });
+// 					Group group = bunnyLodMesh.meshCPU.groups[114];
+// 					SA::Vec4f viewCenter = instanceToWorld * SA::Vec4f(group.center, 1.0f);
+// 					float sphereDistance = SA::Vec3f(viewCenter.x, viewCenter.y, viewCenter.z).Length();
+// 					float errorDistance = std::max(sceneUBO.nearPlane, sphereDistance);
+// 					float errorOverDistance = group.error / errorDistance;
+// 					bool isInView = errorOverDistance >= sceneUBO.errorOverDistance;
+// 
+// 					if (isInView)
+// 					{
+// 						SA_LOG(L"Cluster in view", Info, DX12, (L"Cluster center: (%1, %2, %3), Error over distance: %4", group.center.x, group.center.y, group.center.z, errorOverDistance));
+// 					}
+				#pragma endregion
 
-					if (isInView)
+				#pragma region Cluster LOD Dispatch
+					if constexpr (renderBunnyLodClusters)
 					{
-						SA_LOG(L"Cluster in view", Info, DX12, (L"Cluster center: (%1, %2, %3), Error over distance: %4", group.center.x, group.center.y, group.center.z, errorOverDistance));
+                        cmd->SetGraphicsRootSignature(clusterLodDispatchRootSig.Get());
+                        cmd->SetGraphicsRootConstantBufferView(0, sceneBuffer->GetGPUVirtualAddress());
+                        cmd->SetGraphicsRootShaderResourceView(1, otherObjectBuffer->GetGPUVirtualAddress());
+
+                        cmd->SetGraphicsRootShaderResourceView(2, bunnyLodMesh.positionBuffer->GetGPUVirtualAddress());
+
+                        cmd->SetGraphicsRootShaderResourceView(3, bunnyLodMesh.meshletVertexIndexBuffer->GetGPUVirtualAddress());
+                        cmd->SetGraphicsRootShaderResourceView(4, bunnyLodMesh.meshletTriangleIndexBuffer->GetGPUVirtualAddress());
+
+                        cmd->SetGraphicsRootShaderResourceView(5, bunnyLodMesh.clusterBuffer->GetGPUVirtualAddress());
+                        cmd->SetGraphicsRootShaderResourceView(6, bunnyLodMesh.groupBuffer->GetGPUVirtualAddress());
+
+						cmd->SetGraphicsRootUnorderedAccessView(7, renderClustersBuffer.buffer->GetGPUVirtualAddress());
+
+                        cmd->SetPipelineState(clusterLodDispatchPipelineState.Get());
+                        cmd->ExecuteIndirect(clusterLodDispatchCommandSignature.Get(),
+                                             1, dispatchInfoBuffer.Get(), 0, nullptr, 0);
 					}
+				#pragma endregion
 
 
 					// Manage RenderTargets for present. 0006-U2

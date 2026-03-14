@@ -60,12 +60,12 @@ void processSubtask(const TraversalInfo traversalInfo, uint taskID, uint taskSub
     subTraversalInfo.objectIdx = WaveReadLaneAt(traversalInfo.objectIdx, taskID);
     subTraversalInfo.nodeIdx   = WaveReadLaneAt(traversalInfo.nodeIdx, taskID);
 
-    dump[(32 * currentRun + WaveGetLaneIndex()) * 21 + 18] = subTraversalInfo.objectIdx;
-    dump[(32 * currentRun + WaveGetLaneIndex()) * 21 + 19] = subTraversalInfo.nodeIdx;
+//     dump[(32 * currentRun + WaveGetLaneIndex()) * 21 + 18] = subTraversalInfo.objectIdx;
+//     dump[(32 * currentRun + WaveGetLaneIndex()) * 21 + 19] = subTraversalInfo.nodeIdx;
     DeviceMemoryBarrier();
 
-    if (currentPass >= 1)
-        return;
+//     if (currentPass >= 1)
+//         return;
 
     ClusterNode node    = meshletNodes[subTraversalInfo.nodeIdx];
     uint objIdx         = subTraversalInfo.objectIdx;
@@ -205,26 +205,26 @@ void processSubtasks(inout TraversalInfo traversalInfo, int threadSubcount, bool
 
 
 
-        dump[(32 * r + laneIdx) * 21 + 20] =  uint(runnable);
-        dump[(32 * r + laneIdx) * 21 + 0]  = uint(threadSubcount);
-        dump[(32 * r + laneIdx) * 21 + 1]  = uint(endOffset);
-        dump[(32 * r + laneIdx) * 21 + 2]  = uint(startOffset);
-        dump[(32 * r + laneIdx) * 21 + 3]  = uint(totalLanes);
-        dump[(32 * r + laneIdx) * 21 + 4]  = uint(hasTask);
-        dump[(32 * r + laneIdx) * 21 + 5]  = uint(taskOffset);
-        dump[(32 * r + laneIdx) * 21 + 6]  = uint(taskCount);
-
-        dump[(32 * r + laneIdx) * 21 + 7]  =  uint(firstTaskIdx);
-        dump[(32 * r + laneIdx) * 21 + 8]  =  uint(taskIdx);
-        dump[(32 * r + laneIdx) * 21 + 9]  =  uint(maskLe);
-        dump[(32 * r + laneIdx) * 21 + 10] =  uint(relativeStart);
-        dump[(32 * r + laneIdx) * 21 + 11] =  uint(startBits);
-        dump[(32 * r + laneIdx) * 21 + 12] =  uint(task);
-        dump[(32 * r + laneIdx) * 21 + 13] =  uint(taskID);
-        dump[(32 * r + laneIdx) * 21 + 14] =  uint(taskSubID);
-        dump[(32 * r + laneIdx) * 21 + 15] =  uint(taskSubcount);
-        dump[(32 * r + laneIdx) * 21 + 16] =  uint(taskBase);
-        dump[(32 * r + laneIdx) * 21 + 17] =  uint(taskValid);
+//         dump[(32 * r + laneIdx) * 21 + 20] =  uint(runnable);
+//         dump[(32 * r + laneIdx) * 21 + 0]  = uint(threadSubcount);
+//         dump[(32 * r + laneIdx) * 21 + 1]  = uint(endOffset);
+//         dump[(32 * r + laneIdx) * 21 + 2]  = uint(startOffset);
+//         dump[(32 * r + laneIdx) * 21 + 3]  = uint(totalLanes);
+//         dump[(32 * r + laneIdx) * 21 + 4]  = uint(hasTask);
+//         dump[(32 * r + laneIdx) * 21 + 5]  = uint(taskOffset);
+//         dump[(32 * r + laneIdx) * 21 + 6]  = uint(taskCount);
+// 
+//         dump[(32 * r + laneIdx) * 21 + 7]  =  uint(firstTaskIdx);
+//         dump[(32 * r + laneIdx) * 21 + 8]  =  uint(taskIdx);
+//         dump[(32 * r + laneIdx) * 21 + 9]  =  uint(maskLe);
+//         dump[(32 * r + laneIdx) * 21 + 10] =  uint(relativeStart);
+//         dump[(32 * r + laneIdx) * 21 + 11] =  uint(startBits);
+//         dump[(32 * r + laneIdx) * 21 + 12] =  uint(task);
+//         dump[(32 * r + laneIdx) * 21 + 13] =  uint(taskID);
+//         dump[(32 * r + laneIdx) * 21 + 14] =  uint(taskSubID);
+//         dump[(32 * r + laneIdx) * 21 + 15] =  uint(taskSubcount);
+//         dump[(32 * r + laneIdx) * 21 + 16] =  uint(taskBase);
+//         dump[(32 * r + laneIdx) * 21 + 17] =  uint(taskValid);
         
         processSubtask(traversalInfo, taskID, min(taskSubID, taskSubcount-1), taskValid, currentPass, r);
     }
@@ -233,7 +233,7 @@ void processSubtasks(inout TraversalInfo traversalInfo, int threadSubcount, bool
 void run(uint gtid)
 {
     uint laneReadIndex = invalidLane;
-    for (uint currentPass = 0; currentPass < 2; ++currentPass)
+    for (uint currentPass = 0; ; ++currentPass)
     {
         // meaning it's the first time in this
         if (WaveActiveAllTrue(laneReadIndex == invalidLane))
