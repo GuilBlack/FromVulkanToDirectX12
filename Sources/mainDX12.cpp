@@ -475,8 +475,8 @@ struct ObjectUBO
 constexpr SA::Vec3f spherePosition(-2.0f, 0.0f, 2.0f);
 MComPtr<ID3D12Resource> sphereObjectBuffer;
 MComPtr<ID3D12Resource> otherObjectBuffer;
-constexpr uint32_t objectCount = 1;
-constexpr uint32_t objectCountSqrt = 1;
+constexpr uint32_t objectCount = 1000;
+constexpr uint32_t objectCountPerDim = 10;
 
 struct UAVBufferResource
 {
@@ -3092,13 +3092,18 @@ int main()
 
 					SA::Quatf rot = SA::Quatf::FromEuler(SA::Vec3f(90.0f, 0.0f, 0.0f));
 					auto matRot = SA::Mat4f::MakeRotation(rot);
-					for (int x = 0; x < objectCountSqrt; ++x)
+					for (int x = 0; x < objectCountPerDim; ++x)
 					{
-						for (int z = 0; z < objectCountSqrt; ++z)
+						for (int y = 0; y < objectCountPerDim; ++y)
 						{
-							//const SA::Vec3f pos = SA::Vec3f(-25.f + x * 5.0f, 0.0f, 10.f + z * 5.f);
-							const SA::Vec3f pos = SA::Vec3f(0.0f, 0.0f, 30.f);
-							transforms[x * objectCountSqrt + z] = SA::Mat4f::MakeTranslation(pos);
+							for (int z = 0; z < objectCountPerDim; ++z)
+							{
+                                int index = x * objectCountPerDim * objectCountPerDim +
+									y * objectCountPerDim +
+									z;
+								const SA::Vec3f pos = SA::Vec3f(-25.f + x * 5.0f, -25.f + y * 5.0f, 10.f + z * 5.f);
+								transforms[index] = SA::Mat4f::MakeTranslation(pos);
+							}
 						}
 					}
 					const bool bSubmitSuccess = SubmitBufferToGPU(otherObjectBuffer, desc.Width, &transforms, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
@@ -3961,7 +3966,7 @@ int main()
 						cmd->SetComputeRootUnorderedAccessView(5, traversalInfoBuffer.buffer->GetGPUVirtualAddress());
 
 						cmd->SetPipelineState(computeInitPipelineState.Get());
-						cmd->Dispatch(1,1,1);
+						cmd->Dispatch(1, 1, 1);
 
 						D3D12_RESOURCE_BARRIER barrier = CD3DX12_RESOURCE_BARRIER::UAV(traversalCounterBuffer.buffer.Get());
 						cmd->ResourceBarrier(1, &barrier);
@@ -3983,8 +3988,8 @@ int main()
 						cmd->SetComputeRootUnorderedAccessView(8, dumpUav->GetGPUVirtualAddress());
 
 						cmd->SetPipelineState(traversalRunPipelineState.Get());
-						//cmd->Dispatch(4096 / 32, 1, 1);
-						cmd->Dispatch(1, 1, 1);
+						cmd->Dispatch(4096 / 32, 1, 1);
+						//cmd->Dispatch(1, 1, 1);
 
 						barrier = CD3DX12_RESOURCE_BARRIER::UAV(traversalCounterBuffer.buffer.Get());
 						cmd->ResourceBarrier(1, &barrier);

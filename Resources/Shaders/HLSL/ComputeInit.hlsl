@@ -22,14 +22,11 @@ StructuredBuffer<ClusterNode>   meshletNodes : register(t1);
 RWStructuredBuffer<uint>            counters : register(u0);
 RWStructuredBuffer<TraversalInfo>   traversalInfos : register(u1);
 
+// TODO: optimize this xD
 [RootSignature(ROOT_SIG)]
 [numthreads(1, 1, 1)]
 void main()
 {
-    counters[traversalInfoReadCounter] = 0;
-    counters[traversalTaskCounter] = 0;
-    counters[traversalInfoWriteCounter] = 0;
-    counters[renderClusterCounter] = 0;
     DeviceMemoryBarrier();
     for (uint i = 0; i < pushConstants.NumInstances; ++i)
     {
