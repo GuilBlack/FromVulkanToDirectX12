@@ -1685,27 +1685,43 @@ uint32_t ImportMeshLod(
 
 void DestroyMesh(Mesh& mesh)
 {
-	SA_LOG(L"Destroying Sphere Index Buffer...", Info, DX12, mesh.IndexBuffer.Get());
+	SA_LOG(L"Destroying Index Buffer...", Info, DX12, mesh.IndexBuffer.Get());
 	mesh.IndexBuffer = nullptr;
 	mesh.IndexBufferView = D3D12_INDEX_BUFFER_VIEW{};
-	SA_LOG(L"Destroying Sphere Vertex Position Buffer...", Info, DX12, mesh.VertexBuffers[0].Get());
+	SA_LOG(L"Destroying Vertex Position Buffer...", Info, DX12, mesh.VertexBuffers[0].Get());
 	mesh.VertexBuffers[0] = nullptr;
 	mesh.VertexBufferViews[0] = D3D12_VERTEX_BUFFER_VIEW{};
-	SA_LOG(L"Destroying Sphere Normal Position Buffer...", Info, DX12, mesh.VertexBuffers[1].Get());
+	SA_LOG(L"Destroying Normal Position Buffer...", Info, DX12, mesh.VertexBuffers[1].Get());
 	mesh.VertexBuffers[1] = nullptr;
 	mesh.VertexBufferViews[1] = D3D12_VERTEX_BUFFER_VIEW{};
 
-	SA_LOG(L"Destroying Sphere Tangent Position Buffer...", Info, DX12, mesh.VertexBuffers[2].Get());
+	SA_LOG(L"Destroying Tangent Position Buffer...", Info, DX12, mesh.VertexBuffers[2].Get());
 	mesh.VertexBuffers[2] = nullptr;
 	mesh.VertexBufferViews[2] = D3D12_VERTEX_BUFFER_VIEW{};
-	SA_LOG(L"Destroying Sphere UV Position Buffer...", Info, DX12, mesh.VertexBuffers[3].Get());
+	SA_LOG(L"Destroying UV Position Buffer...", Info, DX12, mesh.VertexBuffers[3].Get());
 	mesh.VertexBuffers[3] = nullptr;
 	mesh.VertexBufferViews[3] = D3D12_VERTEX_BUFFER_VIEW{};
 
-	SA_LOG(L"Destroying Sphere Meshlet Buffers...", Info, DX12, mesh.MeshletBuffer.Get());
+	SA_LOG(L"Destroying Meshlet Buffers...", Info, DX12, mesh.MeshletBuffer.Get());
 	mesh.MeshletBuffer = nullptr;
 	mesh.MeshletVertexIndexBuffer = nullptr;
 	mesh.MeshletTriangleIndexBuffer = nullptr;
+}
+
+void DestroyMeshLOD(MeshLOD& mesh)
+{
+	SA_LOG(L"Destroying Cluster Buffer...", Info, DX12, mesh.clusterBuffer.Get());
+	mesh.clusterBuffer = nullptr;
+	SA_LOG(L"Destroying Meshlet Vertex Index Buffer...", Info, DX12, mesh.meshletVertexIndexBuffer.Get());
+	mesh.meshletVertexIndexBuffer = nullptr;
+	SA_LOG(L"Destroying Meshlet Triangle Index Buffer...", Info, DX12, mesh.meshletTriangleIndexBuffer.Get());
+	mesh.meshletTriangleIndexBuffer = nullptr;
+	SA_LOG(L"Destroying Group Buffer...", Info, DX12, mesh.groupBuffer.Get());
+	mesh.groupBuffer = nullptr;
+	SA_LOG(L"Destroying Node Buffer...", Info, DX12, mesh.nodeBuffer.Get());
+	mesh.nodeBuffer = nullptr;
+	SA_LOG(L"Destroying Position Buffer...", Info, DX12, mesh.positionBuffer.Get());
+	mesh.positionBuffer = nullptr;
 }
 
 // = Sphere =
@@ -2779,78 +2795,78 @@ int main()
 
 			#pragma region Meshlet LOD Dispatch
 				{
-                    D3D12_INDIRECT_ARGUMENT_DESC argDesc = {};
-                    argDesc.Type = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH;
+					D3D12_INDIRECT_ARGUMENT_DESC argDesc = {};
+					argDesc.Type = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH;
 					argDesc.UnorderedAccessView.RootParameterIndex = 3;
 
-                    D3D12_COMMAND_SIGNATURE_DESC sigDesc = {};
-                    sigDesc.ByteStride = sizeof(D3D12_DISPATCH_ARGUMENTS);
-                    sigDesc.NumArgumentDescs = 1;
-                    sigDesc.pArgumentDescs = &argDesc;
-                    sigDesc.NodeMask = 0;
+					D3D12_COMMAND_SIGNATURE_DESC sigDesc = {};
+					sigDesc.ByteStride = sizeof(D3D12_DISPATCH_ARGUMENTS);
+					sigDesc.NumArgumentDescs = 1;
+					sigDesc.pArgumentDescs = &argDesc;
+					sigDesc.NodeMask = 0;
 
-                    HRESULT hr = device->CreateCommandSignature(
-                        &sigDesc,
-                        nullptr, // no root args changed by the indirect command
-                        IID_PPV_ARGS(&clusterLodDispatchCommandSignature)
-                    );
+					HRESULT hr = device->CreateCommandSignature(
+						&sigDesc,
+						nullptr, // no root args changed by the indirect command
+						IID_PPV_ARGS(&clusterLodDispatchCommandSignature)
+					);
 					if (FAILED(hr))
 					{
 						SA_LOG(L"Create Cluster LOD Dispatch Command Signature failed!", Error, DX12, (L"Error Code: %1", hr));
 						return EXIT_FAILURE;
-                    }
+					}
 
-                    MComPtr<ID3DBlob> clusterLodDispatchMS = CompileShader(L"Resources/Shaders/HLSL/ClusterLodDispatch.hlsl", L"mainMS", L"ms_6_5");
-                    if (!clusterLodDispatchMS)
-                        return EXIT_FAILURE;
-                    MComPtr<ID3DBlob> clusterLodDispatchPixel = CompileShader(L"Resources/Shaders/HLSL/ClusterLodDispatch.hlsl", L"mainPS", L"ps_6_5");
-                    if (!clusterLodDispatchPixel)
-                        return EXIT_FAILURE;
+					MComPtr<ID3DBlob> clusterLodDispatchMS = CompileShader(L"Resources/Shaders/HLSL/ClusterLodDispatch.hlsl", L"mainMS", L"ms_6_5");
+					if (!clusterLodDispatchMS)
+						return EXIT_FAILURE;
+					MComPtr<ID3DBlob> clusterLodDispatchPixel = CompileShader(L"Resources/Shaders/HLSL/ClusterLodDispatch.hlsl", L"mainPS", L"ps_6_5");
+					if (!clusterLodDispatchPixel)
+						return EXIT_FAILURE;
 
-                    HRESULT hres = device->CreateRootSignature(0, clusterLodDispatchMS->GetBufferPointer(), clusterLodDispatchMS->GetBufferSize(), IID_PPV_ARGS(&clusterLodDispatchRootSig));
-                    if (FAILED(hres))
-                    {
-                        SA_LOG(L"Create ClusterLodDispatchRootSig failed!", Error, DX12, (L"Error Code: %1", hres));
-                        return EXIT_FAILURE;
-                    }
-                    SA_LOG(L"Create ClusterLodDispatchRootSig success.", Info, DX12, clusterLodDispatchRootSig.Get());
-                    clusterLodDispatchRootSig->SetName(L"ClusterLodDispatchRootSig");
+					HRESULT hres = device->CreateRootSignature(0, clusterLodDispatchMS->GetBufferPointer(), clusterLodDispatchMS->GetBufferSize(), IID_PPV_ARGS(&clusterLodDispatchRootSig));
+					if (FAILED(hres))
+					{
+						SA_LOG(L"Create ClusterLodDispatchRootSig failed!", Error, DX12, (L"Error Code: %1", hres));
+						return EXIT_FAILURE;
+					}
+					SA_LOG(L"Create ClusterLodDispatchRootSig success.", Info, DX12, clusterLodDispatchRootSig.Get());
+					clusterLodDispatchRootSig->SetName(L"ClusterLodDispatchRootSig");
 					D3DX12_MESH_SHADER_PIPELINE_STATE_DESC clusterLodDispatchPSODesc = {};
-                    clusterLodDispatchPSODesc.pRootSignature = clusterLodDispatchRootSig.Get();
+					clusterLodDispatchPSODesc.pRootSignature = clusterLodDispatchRootSig.Get();
 					clusterLodDispatchPSODesc.MS = {
 						.pShaderBytecode = clusterLodDispatchMS->GetBufferPointer(),
 						.BytecodeLength = clusterLodDispatchMS->GetBufferSize()
-                    };
+					};
 					clusterLodDispatchPSODesc.PS = {
 						.pShaderBytecode = clusterLodDispatchPixel->GetBufferPointer(),
 						.BytecodeLength = clusterLodDispatchPixel->GetBufferSize()
 					};
 					clusterLodDispatchPSODesc.RTVFormats[0] = sceneColorFormat;
 
-                    clusterLodDispatchPSODesc.NumRenderTargets = 1;
-                    clusterLodDispatchPSODesc.DSVFormat = sceneDepthFormat;
-                    clusterLodDispatchPSODesc.RasterizerState = CD3DX12_RASTERIZER_DESC(D3D12_DEFAULT);
-                    clusterLodDispatchPSODesc.RasterizerState.FrontCounterClockwise = FALSE;
-                    clusterLodDispatchPSODesc.RasterizerState.CullMode = D3D12_CULL_MODE_BACK;
-                    clusterLodDispatchPSODesc.BlendState = CD3DX12_BLEND_DESC(D3D12_DEFAULT);
-                    clusterLodDispatchPSODesc.DepthStencilState = CD3DX12_DEPTH_STENCIL_DESC(D3D12_DEFAULT);
-                    clusterLodDispatchPSODesc.SampleMask = UINT_MAX;
-                    clusterLodDispatchPSODesc.SampleDesc = DefaultSampleDesc();
-                    auto psoStream = CD3DX12_PIPELINE_MESH_STATE_STREAM(clusterLodDispatchPSODesc);
-                    D3D12_PIPELINE_STATE_STREAM_DESC streamDesc = {
-                        .SizeInBytes = sizeof(psoStream),
-                        .pPipelineStateSubobjectStream = &psoStream
-                    };
-                    hres = device->CreatePipelineState(&streamDesc, IID_PPV_ARGS(&clusterLodDispatchPipelineState));
+					clusterLodDispatchPSODesc.NumRenderTargets = 1;
+					clusterLodDispatchPSODesc.DSVFormat = sceneDepthFormat;
+					clusterLodDispatchPSODesc.RasterizerState = CD3DX12_RASTERIZER_DESC(D3D12_DEFAULT);
+					clusterLodDispatchPSODesc.RasterizerState.FrontCounterClockwise = FALSE;
+					clusterLodDispatchPSODesc.RasterizerState.CullMode = D3D12_CULL_MODE_BACK;
+					clusterLodDispatchPSODesc.BlendState = CD3DX12_BLEND_DESC(D3D12_DEFAULT);
+					clusterLodDispatchPSODesc.DepthStencilState = CD3DX12_DEPTH_STENCIL_DESC(D3D12_DEFAULT);
+					clusterLodDispatchPSODesc.SampleMask = UINT_MAX;
+					clusterLodDispatchPSODesc.SampleDesc = DefaultSampleDesc();
+					auto psoStream = CD3DX12_PIPELINE_MESH_STATE_STREAM(clusterLodDispatchPSODesc);
+					D3D12_PIPELINE_STATE_STREAM_DESC streamDesc = {
+						.SizeInBytes = sizeof(psoStream),
+						.pPipelineStateSubobjectStream = &psoStream
+					};
+					hres = device->CreatePipelineState(&streamDesc, IID_PPV_ARGS(&clusterLodDispatchPipelineState));
 					if (FAILED(hres))
 					{
 						SA_LOG(L"Create ClusterLodDispatchPipelineState failed!", Error, DX12, (L"Error Code: %1", hres));
 						return EXIT_FAILURE;
 					}
 					SA_LOG(L"Create ClusterLodDispatchPipelineState success.", Info, DX12, clusterLodDispatchPipelineState.Get());
-                    clusterLodDispatchPipelineState->SetName(L"ClusterLodDispatchPipelineState");
+					clusterLodDispatchPipelineState->SetName(L"ClusterLodDispatchPipelineState");
 				}
-            #pragma endregion
+			#pragma endregion
 
 			#pragma region CLOD Compute
 				{
@@ -3098,7 +3114,7 @@ int main()
 						{
 							for (int z = 0; z < objectCountPerDim; ++z)
 							{
-                                int index = x * objectCountPerDim * objectCountPerDim +
+								int index = x * objectCountPerDim * objectCountPerDim +
 									y * objectCountPerDim +
 									z;
 								const SA::Vec3f pos = SA::Vec3f(-25.f + x * 5.0f, -25.f + y * 5.0f, 10.f + z * 5.f);
@@ -3950,7 +3966,7 @@ int main()
 
 					auto sceneColorRT = swapchainImages[swapchainFrameIndex];
 
-                #pragma region Compute Pass: Clustered LoD Traversal
+				#pragma region Compute Pass: Clustered LoD Traversal
 					{
 						ClearComputeUAVs();
 
@@ -4012,7 +4028,7 @@ int main()
 						cmd->ResourceBarrier(1, &barrier);
 
 						barrier = CD3DX12_RESOURCE_BARRIER::Transition(dispatchInfoBuffer.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
-                        cmd->ResourceBarrier(1, &barrier);
+						cmd->ResourceBarrier(1, &barrier);
 					}
 				#pragma endregion
 
@@ -4134,7 +4150,7 @@ int main()
 					}
 				#pragma endregion
 
-                #pragma region Meshlet LOD Debug
+				#pragma region Meshlet LOD Debug
 					if constexpr (renderBunnyLodMeshDebug)
 					{
 						auto& levelHigh = bunnyLodMesh.meshCPU.levels[1];
@@ -4189,23 +4205,23 @@ int main()
 				#pragma region Cluster LOD Dispatch
 					if constexpr (renderBunnyLodClusters)
 					{
-                        cmd->SetGraphicsRootSignature(clusterLodDispatchRootSig.Get());
-                        cmd->SetGraphicsRootConstantBufferView(0, sceneBuffer->GetGPUVirtualAddress());
-                        cmd->SetGraphicsRootShaderResourceView(1, otherObjectBuffer->GetGPUVirtualAddress());
+						cmd->SetGraphicsRootSignature(clusterLodDispatchRootSig.Get());
+						cmd->SetGraphicsRootConstantBufferView(0, sceneBuffer->GetGPUVirtualAddress());
+						cmd->SetGraphicsRootShaderResourceView(1, otherObjectBuffer->GetGPUVirtualAddress());
 
-                        cmd->SetGraphicsRootShaderResourceView(2, bunnyLodMesh.positionBuffer->GetGPUVirtualAddress());
+						cmd->SetGraphicsRootShaderResourceView(2, bunnyLodMesh.positionBuffer->GetGPUVirtualAddress());
 
-                        cmd->SetGraphicsRootShaderResourceView(3, bunnyLodMesh.meshletVertexIndexBuffer->GetGPUVirtualAddress());
-                        cmd->SetGraphicsRootShaderResourceView(4, bunnyLodMesh.meshletTriangleIndexBuffer->GetGPUVirtualAddress());
+						cmd->SetGraphicsRootShaderResourceView(3, bunnyLodMesh.meshletVertexIndexBuffer->GetGPUVirtualAddress());
+						cmd->SetGraphicsRootShaderResourceView(4, bunnyLodMesh.meshletTriangleIndexBuffer->GetGPUVirtualAddress());
 
-                        cmd->SetGraphicsRootShaderResourceView(5, bunnyLodMesh.clusterBuffer->GetGPUVirtualAddress());
-                        cmd->SetGraphicsRootShaderResourceView(6, bunnyLodMesh.groupBuffer->GetGPUVirtualAddress());
+						cmd->SetGraphicsRootShaderResourceView(5, bunnyLodMesh.clusterBuffer->GetGPUVirtualAddress());
+						cmd->SetGraphicsRootShaderResourceView(6, bunnyLodMesh.groupBuffer->GetGPUVirtualAddress());
 
 						cmd->SetGraphicsRootUnorderedAccessView(7, renderClustersBuffer.buffer->GetGPUVirtualAddress());
 
-                        cmd->SetPipelineState(clusterLodDispatchPipelineState.Get());
-                        cmd->ExecuteIndirect(clusterLodDispatchCommandSignature.Get(),
-                                             1, dispatchInfoBuffer.Get(), 0, nullptr, 0);
+						cmd->SetPipelineState(clusterLodDispatchPipelineState.Get());
+						cmd->ExecuteIndirect(clusterLodDispatchCommandSignature.Get(),
+											 1, dispatchInfoBuffer.Get(), 0, nullptr, 0);
 					}
 				#pragma endregion
 
@@ -4294,13 +4310,20 @@ int main()
 					}
 				}
 
+				// LOD Compute resources
+				{
+					renderClustersBuffer.buffer = nullptr;
+					traversalInfoBuffer.buffer = nullptr;
+					traversalCounterBuffer.buffer = nullptr;
+					dumpUav = nullptr;
+					dispatchInfoBuffer = nullptr;
+				}
+
 				// Meshes
 				{
-					// Sphere
-					{
-						DestroyMesh(sphereMesh);
-						DestroyMesh(dragonMesh);
-					}
+					DestroyMesh(sphereMesh);
+					DestroyMesh(dragonMesh);
+					DestroyMeshLOD(bunnyLodMesh);
 				}
 			}
 
@@ -4337,6 +4360,12 @@ int main()
 				{
 					SA_LOG(L"Destroying PBR Sphere SRV ViewHeap...", Info, DX12, pbrSphereSRVHeap.Get());
 					pbrSphereSRVHeap = nullptr;
+				}
+				
+				// UAV Clear heaps
+				{
+					uavCPUHeap = nullptr;
+					uavGPUHeap = nullptr;
 				}
 			}
 
@@ -4385,6 +4414,24 @@ int main()
 					}
 				}
 
+				// Meshlet LOD pipeline
+				{
+					meshletLodDebugRootSig.Reset();
+					meshletLodDebugPipelineState.Reset();
+					meshletLodDebugBoundsPipelineState.Reset();
+
+					clusterLodDispatchCommandSignature.Reset();
+					clusterLodDispatchRootSig.Reset();
+					clusterLodDispatchPipelineState.Reset();
+
+					traversalRunRootSig.Reset();
+					traversalRunPipelineState.Reset();
+					computeDispatchInfoRootSig.Reset();
+					computeDispatchInfoPipelineState.Reset();
+					computeInitRootSig.Reset();
+					computeInitPipelineState.Reset();
+				}
+
 				shaderCompiler.Reset();
 				shaderCompilerUtils.Reset();
 				shaderIncludeHandler.Reset();
@@ -4398,6 +4445,8 @@ int main()
 
 				SA_LOG(L"Destroying Scene Depth RT ViewHeap...", Info, DX12, sceneDepthRTViewHeap.Get());
 				sceneDepthRTViewHeap = nullptr;
+
+				
 
 				SA_LOG(L"Destroying Scene Depth Texture...", Info, DX12, sceneDepthTexture.Get());
 				sceneDepthTexture = nullptr;
