@@ -1,9 +1,29 @@
-# FromVulkanToDirectX12
+# Nanite-Style Cluster LOD
 
-Learn **DirectX12** graphics API from **Vulkan**.\
-This repository implements a basic **Forward PBR renderer** in both Vulkan and DirectX12 to **compare** the two API and be able to quickly **make links** their implementation.
- - mainDX.cpp: DirectX12 implementation
- - mainVK.cpp: Vulkan implementation
+Initially, this repo was created by one of the teachers from my school (it's a fork from his repo) to be able to switch from Vulkan to DirectX12 with ease.
+
+## Introduction
+
+To challenge myself with mesh shaders, I decided to implement a simple Nanite-style Cluster LOD system in this project. This currently only works with DirectX12 and it's also restricted to one geometry. It also implements some culling within the LOD hierarchy itself, but it doesn't implement any occlusion culling yet (maybe in the future).
+
+Here are 2 screenshots of the current state of the project and what you can expect to see when you run it:
+| Hierarchy preview                                  | Hierarchy with culling preview                          |
+|-----------------                                   |----------------------	                               |
+| ![Screenshot1](Doc/Pictures/Hierarchy_Preview.png) | ![Screenshot2](Doc/Pictures/Hierarchy_with_Culling.png) |
+
+## Controls
+- **WASD** to move the camera.
+- **Mouse** to rotate the camera.
+- **Left Shift** to increase the camera speed.
+- **Space** Freeze the camera in place to better see the culling in action.
+
+## TODO
+- Optimize some compute passes that I know are easy to optimize (I'm talking about you, ComputeInit.hlsl xD).
+- Integrate all the visualization options in a UI or at least as some hotkeys instead of having to comment/uncomment code to visualize the different buffers.
+- Implement some occlusion culling.
+- Make a command line arg to load a custom .obj file instead of the hardcoded one.
+- Add some more comments in the code to make it easier to understand.
+- Try making the task buffer into a ring buffer to save some space (maybe).
 
 ## Required components
 
@@ -50,3 +70,4 @@ Now the project is ready to be open directly from the **root directory** using y
 ## Authors
 
 **Maxime "mrouffet" ROUFFET** - main developer (maximerouffet@gmail.com)
+**Guillaume "GuilBlack" BLACKBURN** - cluster LOD hierarchy developer (guillaume.blackburn1@gmail.com)
