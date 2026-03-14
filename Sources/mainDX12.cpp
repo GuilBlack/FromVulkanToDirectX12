@@ -2831,7 +2831,7 @@ int main()
                     clusterLodDispatchPSODesc.DSVFormat = sceneDepthFormat;
                     clusterLodDispatchPSODesc.RasterizerState = CD3DX12_RASTERIZER_DESC(D3D12_DEFAULT);
                     clusterLodDispatchPSODesc.RasterizerState.FrontCounterClockwise = FALSE;
-                    clusterLodDispatchPSODesc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+                    clusterLodDispatchPSODesc.RasterizerState.CullMode = D3D12_CULL_MODE_BACK;
                     clusterLodDispatchPSODesc.BlendState = CD3DX12_BLEND_DESC(D3D12_DEFAULT);
                     clusterLodDispatchPSODesc.DepthStencilState = CD3DX12_DEPTH_STENCIL_DESC(D3D12_DEFAULT);
                     clusterLodDispatchPSODesc.SampleMask = UINT_MAX;
