@@ -51,6 +51,32 @@ bool testForTraversal(float4x4 instanceToEye, float3 center, float uniformScale,
     return errorOverDistance >= sceneBuffer.errorOverDistance;
 }
 
+float DistToPlane(float3 planeNormal, float3 planePoint, float3 p)
+{
+    return dot(normalize(planeNormal), p - planePoint);
+}
+
+bool isMeshletVisible(float3 center, float radius, float4x4 world)
+{
+    float3 worldCenter = mul(world, float4(center, 1)).xyz;
+
+    bool isInFrustum = true;
+    for (int i = 0; i < 6; ++i)
+    {
+        float d = sceneBuffer.useOldPlanes != 0 ?
+                DistToPlane(sceneBuffer.oldPlanes[i].normal, sceneBuffer.oldPlanes[i].position, worldCenter) :
+                DistToPlane(sceneBuffer.planes[i].normal, sceneBuffer.planes[i].position, worldCenter);
+
+        if (d < -radius)
+        {
+            isInFrustum = false;
+            break;
+        }
+    }
+
+    return isInFrustum;
+}
+
 groupshared uint s_nodesOffsets[NUM_THREADS];
 groupshared uint s_temp[NUM_THREADS];
 
@@ -112,9 +138,10 @@ void processSubtask(const TraversalInfo traversalInfo, uint taskID, uint taskSub
     float errorScale    = 1.0;
 
     // TODO: replace the 1.0 by the uniform scale later on.
-    bool traverse      = testForTraversal(mul(sceneBuffer.view, world), center, 1.0, radius, error);
-    bool traverseNode  = taskValid && node.isLeaf == false && traverse;
-    bool renderCluster = taskValid && node.isLeaf && (!traverse || forceCluster);
+    bool traverse      = testForTraversal(mul(sceneBuffer.view, world), center, uniformScale, radius, error);
+    bool visible       = isMeshletVisible(center, radius * uniformScale, world);
+    bool traverseNode  = taskValid && visible && node.isLeaf == false && traverse;
+    bool renderCluster = taskValid && visible && node.isLeaf && (!traverse || forceCluster);
 
     uint4 voteNodes = WaveActiveBallot(traverseNode);
     uint nodesCount = WaveActiveCountBits(traverseNode);

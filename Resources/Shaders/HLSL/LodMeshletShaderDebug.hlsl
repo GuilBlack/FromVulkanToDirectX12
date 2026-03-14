@@ -49,14 +49,6 @@ float DistToPlane(float3 planeNormal, float3 planePoint, float3 p)
 bool IsMeshletVisible(Cluster c, float4x4 world)
 {
     float3 worldCenter = mul(world, float4(c.Center, 1)).xyz;
-    ClusterGroup group = meshletGroups[c.GroupIndex];
-    ClusterNode node = meshletNodes[0];
-
-    for (uint i = 0; i < group.clusterCount; ++i)
-    {
-        if (node.isLeaf != 0)
-            break;
-    }
 
     bool isInFrustum = true;
     for (int i = 0; i < 6; ++i)
