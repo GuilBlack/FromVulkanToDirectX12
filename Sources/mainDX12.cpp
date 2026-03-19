@@ -2898,7 +2898,7 @@ int main()
 				}
 
 				{
-					MComPtr<ID3DBlob> computeInitShader = CompileShader(L"Resources/Shaders/HLSL/ComputeInit.hlsl", L"main", L"cs_6_5");
+					MComPtr<ID3DBlob> computeInitShader = CompileShader(L"Resources/Shaders/HLSL/ComputeInit.hlsl", L"main", L"cs_6_6");
 					if (!computeInitShader)
 						return EXIT_FAILURE;
 					HRESULT hres = device->CreateRootSignature(0, computeInitShader->GetBufferPointer(), computeInitShader->GetBufferSize(), IID_PPV_ARGS(&computeInitRootSig));
@@ -3370,7 +3370,7 @@ int main()
 
 						if constexpr (renderBunnyLodMeshDebug || renderBunnyLodClusters)
 						{
-							path = "Resources/Models/Bunny.obj";
+							path = "Resources/Models/Dragon.obj";
 							r = ImportMeshLod(path, L"Bunny", bunnyLodMesh);
 							if (r == EXIT_FAILURE)
 							{
@@ -3982,7 +3982,7 @@ int main()
 						cmd->SetComputeRootUnorderedAccessView(5, traversalInfoBuffer.buffer->GetGPUVirtualAddress());
 
 						cmd->SetPipelineState(computeInitPipelineState.Get());
-						cmd->Dispatch(1, 1, 1);
+						cmd->Dispatch((objectCount + 31) / 32, 1, 1);
 
 						D3D12_RESOURCE_BARRIER barrier = CD3DX12_RESOURCE_BARRIER::UAV(traversalCounterBuffer.buffer.Get());
 						cmd->ResourceBarrier(1, &barrier);

@@ -19,25 +19,27 @@ ConstantBuffer<Scene>           sceneBuffer : register(b1);
 StructuredBuffer<Object>        objectBuffer : register(t0);
 StructuredBuffer<ClusterNode>   meshletNodes : register(t1);
 
-RWStructuredBuffer<uint>            counters : register(u0);
-RWStructuredBuffer<TraversalInfo>   traversalInfos : register(u1);
+RWStructuredBuffer<uint>                            counters : register(u0);
+RWStructuredBuffer<TraversalInfo>  traversalInfos : register(u1);
 
-// TODO: optimize this xD
 [RootSignature(ROOT_SIG)]
-[numthreads(1, 1, 1)]
-void main()
+[WaveSize(32)]
+[numthreads(32, 1, 1)]
+void main(
+    uint id : SV_DispatchThreadID,
+    uint groupId : SV_GroupID
+)
 {
-    DeviceMemoryBarrier();
-    for (uint i = 0; i < pushConstants.NumInstances; ++i)
+    if (id == 0)
     {
-        uint traversalInfoOffset;
-        InterlockedAdd(counters[traversalTaskCounter], 1, traversalInfoOffset);
-        uint dummy;
-        InterlockedAdd(counters[traversalInfoWriteCounter], 1, dummy);
-
-        TraversalInfo info;
-        info.objectIdx = i;
-        info.nodeIdx = 0;
-        traversalInfos[traversalInfoOffset] = info;
+        counters[traversalTaskCounter] = pushConstants.NumInstances;
+        counters[traversalInfoWriteCounter] = pushConstants.NumInstances;
     }
+    if (id >= pushConstants.NumInstances)
+        return;
+
+    TraversalInfo info;
+    info.objectIdx = id;
+    info.nodeIdx = 0;
+    traversalInfos[id] = info;
 }
