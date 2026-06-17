@@ -1,7 +1,7 @@
 // Copyright 2026 Guillaume BLACKBURN
 // 
 // Permission is hereby granted, free of charge, to any person obtaining a copy of this
-// software and associated documentation files (the “Software”), to deal in the Software
+// software and associated documentation files (the ï¿½Softwareï¿½), to deal in the Software
 // without restriction, including without limitation the rights to use, copy, modify,
 // merge, publish, distribute, sublicense, and/or sell copies of the Software, and to
 // permit persons to whom the Software is furnished to do so, subject to the following conditions:
@@ -9,12 +9,17 @@
 // The above copyright notice and this permission notice shall be included in all
 // copies or substantial portions of the Software.
 // 
-// THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// THE SOFTWARE IS PROVIDED ï¿½AS ISï¿½, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
 // IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
 // FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
 // AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
 // WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF
 // OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+// this shader is HEAVILY based on the one in nvidia's vk_lod_cluster
+// check it out for a more complete implementation that handles a lot more
+// things :thumbsup:
+// here's the link to their repo: https://github.com/nvpro-samples/vk_lod_clusters
 
 #define ROOT_SIG "CBV(b0), \
                   SRV(t0), \
@@ -25,10 +30,6 @@
                   UAV(u1), \
                   UAV(u2), \
                   UAV(u3)"
-
-// this shader is HEAVILY based on the one in nvidia's vk_lod_cluster
-// check it out for a more complete implementation that handles a lot more
-// things :thumbsup:
 
 #include "CommonStructs.h"
 #include "CommonCluster.h"
@@ -106,10 +107,6 @@ void processSubtask(const TraversalInfo traversalInfo, uint taskID, uint taskSub
 
 //     dump[(32 * currentRun + WaveGetLaneIndex()) * 21 + 18] = subTraversalInfo.objectIdx;
 //     dump[(32 * currentRun + WaveGetLaneIndex()) * 21 + 19] = subTraversalInfo.nodeIdx;
-    DeviceMemoryBarrier();
-
-//     if (currentPass >= 1)
-//         return;
 
     ClusterNode node    = meshletNodes[subTraversalInfo.nodeIdx];
     uint objIdx         = subTraversalInfo.objectIdx;
@@ -177,7 +174,6 @@ void processSubtask(const TraversalInfo traversalInfo, uint taskID, uint taskSub
          InterlockedAdd(counters[traversalInfoWriteCounter], nodesCount, offsetNodes);
          InterlockedAdd(counters[renderClusterCounter], clustersCount, offsetClusters);
     }
-    DeviceMemoryBarrier();
 
     offsetNodes = WaveReadLaneFirst(offsetNodes);
     offsetNodes += WavePrefixCountBits(traverseNode);
@@ -191,10 +187,7 @@ void processSubtask(const TraversalInfo traversalInfo, uint taskID, uint taskSub
     bool doStore = traverseNode || renderCluster;
 
      if (traverseNode && subTraversalInfo.nodeIdx < sceneBuffer.totalNodes)
-     {
-         DeviceMemoryBarrier();
          traversalInfos[offsetNodes] = subTraversalInfo;
-     }
 
      if (renderCluster)
          renderClusters[offsetClusters] = subTraversalInfo;
@@ -248,8 +241,6 @@ void processSubtasks(inout TraversalInfo traversalInfo, int threadSubcount, bool
 
         uint taskReadIndex  = WaveReadLaneAt(laneReadIndex, taskID);
 
-
-
 //         dump[(32 * r + laneIdx) * 21 + 20] =  uint(runnable);
 //         dump[(32 * r + laneIdx) * 21 + 0]  = uint(threadSubcount);
 //         dump[(32 * r + laneIdx) * 21 + 1]  = uint(endOffset);
@@ -270,7 +261,6 @@ void processSubtasks(inout TraversalInfo traversalInfo, int threadSubcount, bool
 //         dump[(32 * r + laneIdx) * 21 + 15] =  uint(taskSubcount);
 //         dump[(32 * r + laneIdx) * 21 + 16] =  uint(taskBase);
 //         dump[(32 * r + laneIdx) * 21 + 17] =  uint(taskValid);
-        
         processSubtask(traversalInfo, taskID, min(taskSubID, taskSubcount-1), taskValid, currentPass, r);
     }
 }
@@ -299,8 +289,6 @@ void run(uint gtid)
         {
             if (laneReadIndex != invalidLane)
             {
-                DeviceMemoryBarrier();
-
                 traversalInfo  = traversalInfos[laneReadIndex];
                 threadRunnable = traversalInfo.objectIdx != invalidTraversalInfo && traversalInfo.nodeIdx != invalidTraversalInfo;
             }
